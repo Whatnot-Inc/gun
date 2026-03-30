@@ -64,20 +64,23 @@ tls_handshake_start(Event, State) ->
 tls_handshake_end(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-request_start(Event=#{stream_ref := StreamRef}, State=#{table := Tid}) ->
-	_ = ets:update_counter(Tid, self(), +1, {self(), 0}),
+request_start(Event=#{stream_ref := StreamRef}, State=#{manager := Manager, stream_count := Count}) ->
+	NewCount = Count + 1,
+	gen_statem:cast(Manager, {stream_count, self(), NewCount}),
 	propagate(Event, State#{
+		stream_count => NewCount,
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME).
 
 request_headers(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-request_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
+request_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager, stream_count := Count}) ->
 	State = case State0 of
 		#{StreamRef := {nofin, fin}} ->
-			_ = ets:update_counter(Tid, self(), -1),
-			maps:remove(StreamRef, State0);
+			NewCount = Count - 1,
+			gen_statem:cast(Manager, {stream_count, self(), NewCount}),
+			maps:remove(StreamRef, State0#{stream_count => NewCount});
 		#{StreamRef := {nofin, IsFin}} ->
 			State0#{StreamRef => {fin, IsFin}}
 	end,
@@ -101,11 +104,12 @@ response_headers(Event, State) ->
 response_trailers(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-response_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
+response_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager, stream_count := Count}) ->
 	State = case State0 of
 		#{StreamRef := {fin, nofin}} ->
-			_ = ets:update_counter(Tid, self(), -1),
-			maps:remove(StreamRef, State0);
+			NewCount = Count - 1,
+			gen_statem:cast(Manager, {stream_count, self(), NewCount}),
+			maps:remove(StreamRef, State0#{stream_count => NewCount});
 		#{StreamRef := {IsFin, nofin}} ->
 			State0#{StreamRef => {IsFin, fin}}
 	end,
@@ -138,14 +142,14 @@ origin_changed(Event, State) ->
 cancel(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-disconnect(Event, State=#{table := Tid}) ->
-	%% The ets:delete/2 call might fail when the pool has shut down.
+disconnect(Event, State=#{manager := Manager}) ->
+	%% The cast might fail when the pool has shut down.
 	try
-		true = ets:delete(Tid, self())
+		gen_statem:cast(Manager, {stream_count, self(), 0})
 	catch _:_ ->
 		ok
 	end,
-	propagate(Event, maps:with([event_handler, table], State), ?FUNCTION_NAME).
+	propagate(Event, (maps:with([event_handler, manager], State))#{stream_count => 0}, ?FUNCTION_NAME).
 
 terminate(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).

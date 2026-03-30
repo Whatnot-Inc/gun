@@ -147,9 +147,11 @@
 	host :: inet:hostname() | inet:ip_address(),
 	port :: inet:port_number(),
 	opts :: opts(),
-	table :: ets:tid(),
 	conns :: #{pid() => down | {setup, any()} | {up, http | http2 | ws | raw, map()}},
 	conns_meta = #{} :: meta(),
+	available = gb_trees:empty() :: gb_trees:tree(),
+	stream_counts = #{} :: #{pid() => non_neg_integer()},
+	up_count = 0 :: non_neg_integer(),
 	await_up = [] :: [{pid(), any()}]
 }).
 
@@ -488,18 +490,18 @@ ws_send(Frames, WsSendOpts=#{authority := Authority}) ->
 %%
 %% The pool manager installs an event handler into each connection.
 %% The event handler is responsible for counting the number of
-%% active streams. It updates the gun_pooled_conns ets table
+%% active streams. It casts stream count updates to the manager
 %% whenever a stream begins or ends.
+%%
+%% The manager maintains a gb_tree keyed by {StreamCount, ConnPid}
+%% to efficiently find the connection with the fewest active
+%% streams. This gives O(log n) lookup instead of O(n).
 %%
 %% A connection is deemed suitable if it is possible to open new
 %% streams. How many streams can be open at any one time depends
 %% on the protocol. For HTTP/2 the manager process keeps track of
 %% the connection's settings to know the maximum. For non-stream
 %% based protocols, there is no limit.
-%%
-%% The connection to be used is otherwise chosen randomly. The
-%% first connection that is suitable is returned. There is no
-%% need to "give back" the connection to the manager.
 
 %% @todo
 %% What should happen if we always fail to reconnect? I suspect we keep the manager
@@ -513,10 +515,9 @@ start_link(Host, Port, Opts) ->
 init({Host, Port, Opts}) ->
 	process_flag(trap_exit, true),
 	true = ets:insert_new(gun_pools, {gun_pools_key(Host, Port, Opts), self()}),
-	Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
 	Size = maps:get(size, Opts, 8),
 	%% @todo Only start processes in static mode.
-	ConnOpts = conn_opts(Tid, Opts),
+	ConnOpts = conn_opts(self(), Opts),
 	Conns = maps:from_list([begin
 		{ok, ConnPid} = gun:open(Host, Port, ConnOpts),
 		_ = monitor(process, ConnPid),
@@ -526,7 +527,6 @@ init({Host, Port, Opts}) ->
 		host=Host,
 		port=Port,
 		opts=Opts,
-		table=Tid,
 		conns=Conns
 	},
 	%% If Size is 0 then we can never be operational.
@@ -538,13 +538,14 @@ gun_pools_key(Host, Port, Opts) ->
 	Scope = maps:get(scope, Opts, default),
 	{Scope, iolist_to_binary(Authority)}.
 
-conn_opts(Tid, Opts) ->
+conn_opts(ManagerPid, Opts) ->
 	ConnOpts = maps:get(conn_opts, Opts, #{}),
 	EventHandlerState = maps:with([event_handler], ConnOpts),
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
-			table => Tid
+			manager => ManagerPid,
+			stream_count => 0
 		}},
 		http2_opts => H2Opts#{
 			notify_settings_changed => true
@@ -585,6 +586,7 @@ setup_fun(_) ->
 	end, undefined}.
 
 degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta,
+		available=Available, stream_counts=StreamCounts, up_count=UpCount,
 		await_up=AwaitUp}, SetupFun, SetupState0) ->
 	case SetupFun(ConnPid, Msg, SetupState0) of
 		Setup={setup, _SetupState} ->
@@ -596,7 +598,10 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 			Settings = #{},
 			StateData = StateData0#state{
 				conns=Conns#{ConnPid => {up, Protocol, Settings}},
-				conns_meta=ConnsMeta#{ConnPid => Meta}
+				conns_meta=ConnsMeta#{ConnPid => Meta},
+				available=gb_trees:insert({0, ConnPid}, ConnPid, Available),
+				stream_counts=StreamCounts#{ConnPid => 0},
+				up_count=UpCount + 1
 			},
 			case is_degraded(StateData) of
 				true -> {keep_state, StateData};
@@ -605,11 +610,8 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 			end
 	end.
 
-is_degraded(#state{conns=Conns0}) ->
-	Conns = maps:to_list(Conns0),
-	Len = length(Conns),
-	Ups = [up || {_, {up, _, _}} <- Conns],
-	Len =/= length(Ups).
+is_degraded(#state{conns=Conns, up_count=UpCount}) ->
+	UpCount =/= map_size(Conns).
 
 operational(Type, Event, StateData) ->
 	handle_common(Type, Event, ?FUNCTION_NAME, StateData).
@@ -623,39 +625,77 @@ handle_common({call, From}, {checkout, _ReqOpts}, _,
 			Meta = maps:get(ConnPid, ConnsMeta, #{}),
 			{keep_state_and_data, {reply, From, {ConnPid, Meta}}}
 	end;
+handle_common(cast, {stream_count, ConnPid, NewCount}, _,
+		StateData=#state{available=Available0, stream_counts=StreamCounts}) ->
+	case maps:find(ConnPid, StreamCounts) of
+		{ok, OldCount} ->
+			Available1 = gb_trees:delete({OldCount, ConnPid}, Available0),
+			Available = gb_trees:insert({NewCount, ConnPid}, ConnPid, Available1),
+			{keep_state, StateData#state{
+				available=Available,
+				stream_counts=StreamCounts#{ConnPid => NewCount}
+			}};
+		error ->
+			%% Connection not tracked (down or removed), ignore.
+			keep_state_and_data
+	end;
 handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
 	{keep_state, StateData#state{conns=Conns#{ConnPid => {up, http2, Settings}}}};
-handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _, StateData=#state{conns=Conns}) ->
+handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
+		StateData=#state{conns=Conns, available=Available, stream_counts=StreamCounts, up_count=UpCount}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
-	{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}};
+	OldCount = maps:get(ConnPid, StreamCounts, 0),
+	{next_state, degraded, StateData#state{
+		conns=Conns#{ConnPid => down},
+		available=gb_trees:delete({OldCount, ConnPid}, Available),
+		stream_counts=maps:remove(ConnPid, StreamCounts),
+		up_count=UpCount - 1
+	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
 handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _,
-		StateData=#state{host=Host, port=Port, opts=Opts, table=Tid, conns=Conns0, conns_meta=ConnsMeta0}) ->
+		StateData=#state{host=Host, port=Port, opts=Opts,
+			conns=Conns0, conns_meta=ConnsMeta0,
+			available=Available0, stream_counts=StreamCounts0, up_count=UpCount0}) ->
+	WasUp = case maps:get(ConnPid0, Conns0) of
+		{up, _, _} -> true;
+		_ -> false
+	end,
+	OldCount = maps:get(ConnPid0, StreamCounts0, 0),
 	Conns = maps:remove(ConnPid0, Conns0),
 	ConnsMeta = maps:remove(ConnPid0, ConnsMeta0),
+	Available = case WasUp of
+		true -> gb_trees:delete({OldCount, ConnPid0}, Available0);
+		false -> Available0
+	end,
+	StreamCounts = maps:remove(ConnPid0, StreamCounts0),
+	UpCount = case WasUp of true -> UpCount0 - 1; false -> UpCount0 end,
+	StateData1 = StateData#state{
+		conns=Conns, conns_meta=ConnsMeta,
+		available=Available, stream_counts=StreamCounts, up_count=UpCount
+	},
 	case Reason of
 		%% The process is down because of a configuration error.
 		%% Do NOT attempt to reconnect, leave the pool in a degraded state.
 		badarg ->
-			{next_state, degraded, StateData#state{conns=Conns, conns_meta=ConnsMeta}};
+			{next_state, degraded, StateData1};
 		_ ->
-			ConnOpts = conn_opts(Tid, Opts),
+			ConnOpts = conn_opts(self(), Opts),
 			{ok, ConnPid} = gun:open(Host, Port, ConnOpts),
 			_ = monitor(process, ConnPid),
-			{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}, conns_meta=ConnsMeta}}
+			{next_state, degraded, StateData1#state{conns=Conns#{ConnPid => down}}}
 	end;
 handle_common({call, From}, info, StateName, #state{host=Host, port=Port,
-		opts=Opts, table=Tid, conns=Conns, conns_meta=ConnsMeta}) ->
+		opts=Opts, conns=Conns, conns_meta=ConnsMeta, stream_counts=StreamCounts}) ->
 	{keep_state_and_data, {reply, From, {StateName, #{
 		%% @todo Not sure whether all of this should be documented. Maybe not ConnsMeta for now?
 		host => Host,
 		port => Port,
 		opts => Opts,
-		table => Tid,
 		conns => Conns,
-		conns_meta => ConnsMeta
+		conns_meta => ConnsMeta,
+		stream_counts => StreamCounts
 	}}}};
 handle_common({call, From}, await_up, operational, _) ->
 	{keep_state_and_data, {reply, From, ok}};
@@ -666,36 +706,29 @@ handle_common(Type, Event, StateName, StateData) ->
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 
-%% We go over every connection and return the first one
-%% we find that has capacity. How we determine whether
-%% capacity is available depends on the protocol. For
-%% HTTP/2 we look into the protocol settings. The
-%% current number of streams is maintained by the
-%% event handler gun_pool_events_h.
-find_available_connection(#state{table=Tid, conns=Conns}) ->
-	I = lists:sort([{rand:uniform(), K} || K <- maps:keys(Conns)]),
-	find_available_connection(I, Conns, Tid).
+%% We iterate the gb_tree from smallest (least loaded) to find
+%% the first connection with available capacity. This is O(log n)
+%% in the typical case where the least loaded connection has
+%% capacity, and O(n) worst case when connections have different
+%% max_streams limits.
+find_available_connection(#state{available=Available, conns=Conns}) ->
+	find_available_connection_iter(gb_trees:iterator(Available), Conns).
 
-find_available_connection([], _, _) ->
-	none;
-find_available_connection([{_, ConnPid}|I], Conns, Tid) ->
-	case maps:get(ConnPid, Conns) of
-		{up, Protocol, Settings} ->
-			MaxStreams = max_streams(Protocol, Settings),
-			CurrentStreams = case ets:lookup(Tid, ConnPid) of
-				[] ->
-					0;
-				[{_, CS}] ->
-					CS
-			end,
-			if
-				CurrentStreams + 1 > MaxStreams ->
-					find_available_connection(I, Conns, Tid);
-				true ->
-					ConnPid
-			end;
-		_ ->
-			find_available_connection(I, Conns, Tid)
+find_available_connection_iter(Iter0, Conns) ->
+	case gb_trees:next(Iter0) of
+		none ->
+			none;
+		{{Count, ConnPid}, _, Iter} ->
+			case maps:get(ConnPid, Conns) of
+				{up, Protocol, Settings} ->
+					MaxStreams = max_streams(Protocol, Settings),
+					case Count < MaxStreams of
+						true -> ConnPid;
+						false -> find_available_connection_iter(Iter, Conns)
+					end;
+				_ ->
+					find_available_connection_iter(Iter, Conns)
+			end
 	end.
 
 max_streams(http, _) ->

@@ -117,6 +117,28 @@ hello_pool_ws(Config) ->
 			ok
 	end || _ <- lists:seq(1, 8)].
 
+least_loaded_h2(Config) ->
+	doc("Confirm the pool routes to the connection with the fewest active streams."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => ?FUNCTION_NAME,
+		size => 2
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% Occupy one connection with a delayed request.
+	{async, {BusyPid, _}} = gun_pool:get("/delay",
+		#{<<"host">> => Authority}, #{scope => ?FUNCTION_NAME}),
+	%% Wait for stream count to propagate to the manager.
+	timer:sleep(100),
+	%% Checkout 10 times. All should pick the less loaded connection.
+	%% With random selection, this passes with probability ~0.1%.
+	true = lists:all(fun(_) ->
+		{CheckoutPid, _} = gun_pool:checkout(ManagerPid, #{scope => ?FUNCTION_NAME}),
+		BusyPid =/= CheckoutPid
+	end, lists:seq(1, 10)).
+
 max_streams_h1(Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/1.1 connections."),
