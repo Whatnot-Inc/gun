@@ -569,8 +569,6 @@ conn_opts(#{strategy := least_loaded, manager_pid := ManagerPid}, Opts) ->
 	ConnOpts = maps:get(conn_opts, Opts, #{}),
 	EventHandlerState = maps:with([event_handler], ConnOpts),
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
-	%% @todo Notify the pool process of stream count changes via messages
-	%% instead of writing to an ETS table.
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
 			manager => ManagerPid,
