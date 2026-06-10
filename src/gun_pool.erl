@@ -103,7 +103,7 @@
 	scope => any(),
 	setup_fun => {fun((pid(), setup_msg(), any()) -> any()), any()},
 	size => non_neg_integer(),
-	selection_strategy => random | least_loaded
+	lookup_strategy => random | least_loaded
 }.
 -export_type([opts/0]).
 
@@ -523,7 +523,7 @@ init({Host, Port, Opts}) ->
 	true = ets:insert_new(gun_pools, {gun_pools_key(Host, Port, Opts), self()}),
 	Size = maps:get(size, Opts, 8),
 	%% @todo Only start processes in static mode.
-	Lookup = case maps:get(selection_strategy, Opts, random) of
+	Lookup = case maps:get(lookup_strategy, Opts, random) of
 		random ->
 			Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
 			#{strategy => random, table => Tid};

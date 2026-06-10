@@ -67,7 +67,7 @@ end_per_suite(_) ->
 	ok.
 
 init_per_group(GroupName, Config) ->
-	[{selection_strategy, GroupName} | Config].
+	[{lookup_strategy, GroupName} | Config].
 
 end_per_group(_, _) ->
 	ok.
@@ -84,23 +84,23 @@ do_proto_opts() ->
 
 %% Builds a per-group listener name to avoid collisions between group runs.
 listener_name(FuncName, Config) ->
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	list_to_atom(atom_to_list(FuncName) ++ "_" ++ atom_to_list(Strategy)).
 
 %% Builds a per-group scope to avoid ETS key collisions between group runs.
 scope(FuncName, Config) ->
-	{config(selection_strategy, Config), FuncName}.
+	{config(lookup_strategy, Config), FuncName}.
 
 %% Tests.
 
 hello_pool_h1(Config) ->
 	doc("Confirm the pool can be used for HTTP/1.1 connections."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams = [{async, _} = gun_pool:get("/",
@@ -115,11 +115,11 @@ hello_pool_h1(Config) ->
 hello_pool_h2(Config) ->
 	doc("Confirm the pool can be used for HTTP/2 connections."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams = [{async, _} = gun_pool:get("/",
@@ -134,7 +134,7 @@ hello_pool_h2(Config) ->
 hello_pool_ws(Config) ->
 	doc("Confirm the pool can be used for HTTP/1.1 connections upgraded to Websocket."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{
 			protocols => [http],
@@ -144,7 +144,7 @@ hello_pool_ws(Config) ->
 			}
 		},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		setup_fun => {fun
 			(ConnPid, {gun_up, _, http}, SetupState) ->
 				_ = gun:ws_upgrade(ConnPid, "/ws"),
@@ -171,12 +171,12 @@ max_streams_h1(Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/1.1 connections."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -190,12 +190,12 @@ max_streams_h1_retry(Config) ->
 	doc("Confirm connection checkout is retried when the maximum number "
 		"of streams is reached for HTTP/1.1 connections."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -212,7 +212,7 @@ max_streams_h1_retry(Config) ->
 max_streams_h2_size_1(Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
 	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
@@ -222,7 +222,7 @@ max_streams_h2_size_1(Config) ->
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -233,7 +233,7 @@ max_streams_h2_size_1(Config) ->
 max_streams_h2_size_1_retry(Config) ->
 	doc("Confirm connection checkout is retried when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
 	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
@@ -243,7 +243,7 @@ max_streams_h2_size_1_retry(Config) ->
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -257,7 +257,7 @@ max_streams_h2_size_1_retry(Config) ->
 max_streams_h2_size_2(Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
 	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
@@ -267,7 +267,7 @@ max_streams_h2_size_2(Config) ->
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 2
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -283,7 +283,7 @@ max_streams_h2_size_2(Config) ->
 max_streams_h2_size_2_retry(Config) ->
 	doc("Confirm connection checkout is retried when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
 	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
@@ -293,7 +293,7 @@ max_streams_h2_size_2_retry(Config) ->
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 2
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -313,12 +313,12 @@ kill_restart_h1(Config) ->
 	doc("Confirm the Gun process is restarted and the pool operational "
 		"after an HTTP/1.1 Gun process has crashed."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/",
@@ -350,12 +350,12 @@ kill_restart_h2(Config) ->
 	doc("Confirm the Gun process is restarted and the pool operational "
 		"after an HTTP/2 Gun process has crashed."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/",
@@ -387,7 +387,7 @@ kill_restart_h2(Config) ->
 
 reconnect_h1(Config) ->
 	doc("Confirm the Gun process reconnects automatically for HTTP/1.1 connections."),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
 	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
@@ -397,7 +397,7 @@ reconnect_h1(Config) ->
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/", #{<<"host">> => Authority}) || _ <- lists:seq(1, 8)],
@@ -418,12 +418,12 @@ reconnect_h1(Config) ->
 reconnect_h2(Config) ->
 	doc("Confirm the Gun process reconnects automatically for HTTP/2 connections."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/",
@@ -452,10 +452,10 @@ reconnect_h2(Config) ->
 stop_pool(Config) ->
 	doc("Confirm the pool can be stopped."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy
+		lookup_strategy => Strategy
 	}),
 	gun_pool:await_up(ManagerPid),
 	gun_pool:stop_pool("localhost", Port, #{scope => scope(?FUNCTION_NAME, Config)}).
@@ -472,12 +472,12 @@ do_degraded_configuration_error(Config) ->
 	doc("Confirm the pool ends up in a degraded state "
 		"when connection is impossible because of bad configuration."),
 	Port = config(port, Config),
-	Strategy = config(selection_strategy, Config),
+	Strategy = config(lookup_strategy, Config),
 	%% We attempt to connect to an unreachable IP.
 	{ok, ManagerPid} = gun_pool:start_pool({20, 20, 20, 1}, Port, #{
 		conn_opts => #{tcp_opts => [{ip, {127, 0, 0, 1}}]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => Strategy,
+		lookup_strategy => Strategy,
 		size => 1
 	}),
 	%% Wait for the lookup/connect to fail.
@@ -495,7 +495,7 @@ least_loaded_routing(Config) ->
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => scope(?FUNCTION_NAME, Config),
-		selection_strategy => least_loaded,
+		lookup_strategy => least_loaded,
 		size => 2
 	}),
 	gun_pool:await_up(ManagerPid),
