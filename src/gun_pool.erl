@@ -563,6 +563,7 @@ conn_opts(#{strategy := random, table := Tid}, Opts) ->
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
+			strategy => random,
 			table => Tid
 		}},
 		http2_opts => H2Opts#{
@@ -575,6 +576,7 @@ conn_opts(#{strategy := least_loaded, manager_pid := ManagerPid}, Opts) ->
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
+			strategy => least_loaded,
 			manager => ManagerPid
 		}},
 		http2_opts => H2Opts#{

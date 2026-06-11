@@ -64,12 +64,12 @@ tls_handshake_start(Event, State) ->
 tls_handshake_end(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-request_start(Event=#{stream_ref := StreamRef}, State=#{table := Tid}) ->
+request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := random, table := Tid}) ->
 	_ = ets:update_counter(Tid, self(), +1, {self(), 0}),
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME);
-request_start(Event=#{stream_ref := StreamRef}, State=#{manager := _Manager}) ->
+request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := least_loaded}) ->
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME).
@@ -77,7 +77,7 @@ request_start(Event=#{stream_ref := StreamRef}, State=#{manager := _Manager}) ->
 request_headers(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-request_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
+request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, table := Tid}) ->
 	State = case State0 of
 		#{StreamRef := {nofin, fin}} ->
 			_ = ets:update_counter(Tid, self(), -1),
@@ -86,7 +86,7 @@ request_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
 			State0#{StreamRef => {fin, IsFin}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME);
-request_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager}) ->
+request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, manager := Manager}) ->
 	State = case State0 of
 		#{StreamRef := {nofin, fin}} ->
 			gen_statem:cast(Manager, {release_stream, self()}),
@@ -114,7 +114,7 @@ response_headers(Event, State) ->
 response_trailers(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-response_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
+response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, table := Tid}) ->
 	State = case State0 of
 		#{StreamRef := {fin, nofin}} ->
 			_ = ets:update_counter(Tid, self(), -1),
@@ -123,7 +123,7 @@ response_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
 			State0#{StreamRef => {IsFin, fin}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME);
-response_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager}) ->
+response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, manager := Manager}) ->
 	State = case State0 of
 		#{StreamRef := {fin, nofin}} ->
 			gen_statem:cast(Manager, {release_stream, self()}),
@@ -160,16 +160,16 @@ origin_changed(Event, State) ->
 cancel(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-disconnect(Event, State=#{table := Tid}) ->
+disconnect(Event, State=#{strategy := random, table := Tid}) ->
 	%% The ets:delete/2 call might fail when the pool has shut down.
 	try
 		true = ets:delete(Tid, self())
 	catch _:_ ->
 		ok
 	end,
-	propagate(Event, maps:with([event_handler, table], State), ?FUNCTION_NAME);
-disconnect(Event, State=#{manager := _Manager}) ->
-	propagate(Event, maps:with([event_handler, manager], State), ?FUNCTION_NAME).
+	propagate(Event, maps:with([event_handler, strategy, table], State), ?FUNCTION_NAME);
+disconnect(Event, State=#{strategy := least_loaded}) ->
+	propagate(Event, maps:with([event_handler, strategy, manager], State), ?FUNCTION_NAME).
 
 terminate(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
