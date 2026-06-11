@@ -493,21 +493,25 @@ ws_send(Frames, WsSendOpts=#{authority := Authority}) ->
 %% The event handler is responsible for counting the number of
 %% active streams. For the random strategy it writes stream counts
 %% directly to the gun_pooled_conns ETS table (which is public).
-%% For the least_loaded strategy it casts {stream_count, ConnPid, NewCount}
-%% to the manager process, which updates the gb_tree index and stream
-%% counts map accordingly.
+%% For the least_loaded strategy the manager itself claims a
+%% connection (incrementing its stream count) at checkout time, and
+%% the event handler casts {release_stream, ConnPid} to the manager when
+%% a stream completes, which decrements the count. The manager updates
+%% the gb_tree index and stream counts map accordingly. Claiming at checkout time
+%% avoids a race condition where the same connection would be handed
+%% out repeatedly before the event handler reported the newly opened
+%% stream.
 %%
 %% A connection is deemed suitable if it is possible to open new
 %% streams. How many streams can be open at any one time depends
 %% on the protocol. For HTTP/2 the manager process keeps track of
 %% the connection's settings to know the maximum. For non-stream
-%% based protocols there is no limit.
+%% based protocols there is no limit, and claiming is a no-op.
 %%
 %% For the random strategy, connections are shuffled and the first
 %% suitable one is returned. For the least_loaded strategy the
 %% gb_tree is traversed in ascending order of stream count, returning
-%% the least loaded connection that still has capacity. There is no
-%% need to "give back" the connection to the manager.
+%% the least loaded connection that still has capacity.
 
 %% @todo
 %% What should happen if we always fail to reconnect? I suspect we keep the manager
@@ -571,8 +575,7 @@ conn_opts(#{strategy := least_loaded, manager_pid := ManagerPid}, Opts) ->
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
-			manager => ManagerPid,
-			stream_count => 0
+			manager => ManagerPid
 		}},
 		http2_opts => H2Opts#{
 			notify_settings_changed => true
@@ -677,24 +680,14 @@ handle_common({call, From}, {checkout, _ReqOpts}, _,
 			{keep_state_and_data, {reply, From, undefined}};
 		ConnPid ->
 			Meta = maps:get(ConnPid, ConnsMeta, #{}),
-			{keep_state_and_data, {reply, From, {ConnPid, Meta}}}
+			%% We claim the connection immediately to avoid handing
+			%% out the same connection repeatedly before the stream
+			%% it will carry is reflected in the stream counts.
+			{keep_state, claim_connection(ConnPid, StateData),
+				{reply, From, {ConnPid, Meta}}}
 	end;
-handle_common(cast, {stream_count, ConnPid, NewCount}, _,
-		StateData=#state{lookup=#{available := Available0, stream_counts := StreamCounts} = Lookup}) ->
-	case maps:find(ConnPid, StreamCounts) of
-		{ok, OldCount} ->
-			Available1 = gb_trees:delete({OldCount, ConnPid}, Available0),
-			Available = gb_trees:insert({NewCount, ConnPid}, ConnPid, Available1),
-			{keep_state, StateData#state{
-				lookup=Lookup#{
-					available => Available,
-					stream_counts => StreamCounts#{ConnPid => NewCount}
-				}
-			}};
-		error ->
-			%% Connection not tracked (down or removed), ignore.
-			keep_state_and_data
-	end;
+handle_common(cast, {release_stream, ConnPid}, _, StateData) ->
+	{keep_state, adjust_stream_count(ConnPid, -1, StateData)};
 handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
@@ -784,6 +777,30 @@ handle_common(Type, Event, StateName, StateData) ->
 	logger:error("Unexpected event in state ~p of type ~p:~n~w~n~p~n",
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
+
+claim_connection(_ConnPid, StateData=#state{lookup=#{strategy := random}}) ->
+	StateData;
+claim_connection(ConnPid, StateData=#state{lookup=#{strategy := least_loaded}, conns=Conns}) ->
+	case maps:get(ConnPid, Conns) of
+		{up, ws, _} -> StateData;
+		{up, raw, _} -> StateData;
+		{up, _, _} -> adjust_stream_count(ConnPid, 1, StateData)
+	end.
+
+adjust_stream_count(ConnPid, Delta, StateData=#state{
+		lookup=#{available := Available0, stream_counts := StreamCounts} = Lookup}) ->
+	case maps:find(ConnPid, StreamCounts) of
+		{ok, OldCount} ->
+			NewCount = OldCount + Delta,
+			Available1 = gb_trees:delete({OldCount, ConnPid}, Available0),
+			Available = gb_trees:insert({NewCount, ConnPid}, ConnPid, Available1),
+			StateData#state{lookup=Lookup#{
+				available => Available,
+				stream_counts => StreamCounts#{ConnPid => NewCount}
+			}};
+		error ->
+			StateData
+	end.
 
 %% We go over every connection and return the first one
 %% we find that has capacity. How we determine whether

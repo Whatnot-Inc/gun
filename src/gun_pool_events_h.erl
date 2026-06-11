@@ -69,11 +69,8 @@ request_start(Event=#{stream_ref := StreamRef}, State=#{table := Tid}) ->
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME);
-request_start(Event=#{stream_ref := StreamRef}, State=#{manager := Manager, stream_count := Count}) ->
-	NewCount = Count + 1,
-	gen_statem:cast(Manager, {stream_count, self(), NewCount}),
+request_start(Event=#{stream_ref := StreamRef}, State=#{manager := _Manager}) ->
 	propagate(Event, State#{
-		stream_count => NewCount,
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME).
 
@@ -89,12 +86,11 @@ request_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
 			State0#{StreamRef => {fin, IsFin}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME);
-request_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager, stream_count := Count}) ->
+request_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager}) ->
 	State = case State0 of
 		#{StreamRef := {nofin, fin}} ->
-			NewCount = Count - 1,
-			gen_statem:cast(Manager, {stream_count, self(), NewCount}),
-			maps:remove(StreamRef, State0#{stream_count => NewCount});
+			gen_statem:cast(Manager, {release_stream, self()}),
+			maps:remove(StreamRef, State0);
 		#{StreamRef := {nofin, IsFin}} ->
 			State0#{StreamRef => {fin, IsFin}}
 	end,
@@ -127,12 +123,11 @@ response_end(Event=#{stream_ref := StreamRef}, State0=#{table := Tid}) ->
 			State0#{StreamRef => {IsFin, fin}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME);
-response_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager, stream_count := Count}) ->
+response_end(Event=#{stream_ref := StreamRef}, State0=#{manager := Manager}) ->
 	State = case State0 of
 		#{StreamRef := {fin, nofin}} ->
-			NewCount = Count - 1,
-			gen_statem:cast(Manager, {stream_count, self(), NewCount}),
-			maps:remove(StreamRef, State0#{stream_count => NewCount});
+			gen_statem:cast(Manager, {release_stream, self()}),
+			maps:remove(StreamRef, State0);
 		#{StreamRef := {IsFin, nofin}} ->
 			State0#{StreamRef => {IsFin, fin}}
 	end,
@@ -173,8 +168,8 @@ disconnect(Event, State=#{table := Tid}) ->
 		ok
 	end,
 	propagate(Event, maps:with([event_handler, table], State), ?FUNCTION_NAME);
-disconnect(Event, State=#{manager := _Manager, stream_count := _Count}) ->
-	propagate(Event, maps:with([event_handler, manager, stream_count], State#{stream_count => 0}), ?FUNCTION_NAME).
+disconnect(Event, State=#{manager := _Manager}) ->
+	propagate(Event, maps:with([event_handler, manager], State), ?FUNCTION_NAME).
 
 terminate(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
