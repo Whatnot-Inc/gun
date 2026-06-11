@@ -615,29 +615,8 @@ setup_fun(_) ->
 		{up, Protocol, #{}}
 	end, undefined}.
 
-degraded_setup(ConnPid, Msg, StateData0=#state{lookup=#{strategy := random}, conns=Conns, conns_meta=ConnsMeta,
-		await_up=AwaitUp}, SetupFun, SetupState0) ->
-	case SetupFun(ConnPid, Msg, SetupState0) of
-		Setup={setup, _SetupState} ->
-			StateData = StateData0#state{conns=Conns#{ConnPid => Setup}},
-			{keep_state, StateData};
-		%% The Meta is different from Settings. It allows passing around
-		%% Websocket or tunnel stream refs.
-		{up, Protocol, Meta} ->
-			Settings = #{},
-			StateData = StateData0#state{
-				conns=Conns#{ConnPid => {up, Protocol, Settings}},
-				conns_meta=ConnsMeta#{ConnPid => Meta}
-			},
-		case is_degraded(StateData) of
-			true -> {keep_state, StateData};
-			false -> {next_state, operational, StateData#state{await_up=[]},
-				[{reply, ReplyTo, ok} || ReplyTo <- AwaitUp]}
-		end
-	end;
 degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta,
-		lookup=#{available := Available, stream_counts := StreamCounts, up_count := UpCount} = Lookup,
-		await_up=AwaitUp}, SetupFun, SetupState0) ->
+		lookup=Lookup, await_up=AwaitUp}, SetupFun, SetupState0) ->
 	case SetupFun(ConnPid, Msg, SetupState0) of
 		Setup={setup, _SetupState} ->
 			StateData = StateData0#state{conns=Conns#{ConnPid => Setup}},
@@ -649,11 +628,7 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 			StateData = StateData0#state{
 				conns=Conns#{ConnPid => {up, Protocol, Settings}},
 				conns_meta=ConnsMeta#{ConnPid => Meta},
-				lookup=Lookup#{
-					available => gb_trees:insert({0, ConnPid}, ConnPid, Available),
-					stream_counts => StreamCounts#{ConnPid => 0},
-					up_count => UpCount + 1
-				}
+				lookup=add_up_connection(ConnPid, Lookup)
 			},
 			case is_degraded(StateData) of
 				true -> {keep_state, StateData};
@@ -661,6 +636,16 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 					[{reply, ReplyTo, ok} || ReplyTo <- AwaitUp]}
 			end
 	end.
+
+add_up_connection(_ConnPid, Lookup=#{strategy := random}) ->
+	Lookup;
+add_up_connection(ConnPid, Lookup=#{strategy := least_loaded,
+		available := Available, stream_counts := StreamCounts, up_count := UpCount}) ->
+	Lookup#{
+		available => gb_trees:insert({0, ConnPid}, ConnPid, Available),
+		stream_counts => StreamCounts#{ConnPid => 0},
+		up_count => UpCount + 1
+	}.
 
 is_degraded(#state{lookup=#{strategy := random}, conns=Conns0}) ->
 	Conns = maps:to_list(Conns0),
@@ -802,12 +787,20 @@ adjust_stream_count(ConnPid, Delta, StateData=#state{
 			StateData
 	end.
 
-%% We go over every connection and return the first one
-%% we find that has capacity. How we determine whether
-%% capacity is available depends on the protocol. For
-%% HTTP/2 we look into the protocol settings. The
-%% current number of streams is maintained by the
-%% event handler gun_pool_events_h.
+%% We return a connection that has capacity, or none if there
+%% isn't any. How we determine whether capacity is available
+%% depends on the protocol. For HTTP/2 we look into the protocol
+%% settings.
+%%
+%% For the random strategy we shuffle the connections and return
+%% the first one we find that has capacity. The current number of
+%% streams is maintained in ETS by the event handler gun_pool_events_h.
+%%
+%% For the least_loaded strategy the available connections are kept
+%% in a gb_tree ordered by stream count, so the least loaded one is
+%% simply the smallest entry. The count is maintained by the manager:
+%% it is incremented when a connection is claimed at checkout time and
+%% decremented when the event handler reports a stream has completed.
 find_available_connection(#state{lookup=#{strategy := random, table := Tid}, conns=Conns}) ->
 	I = lists:sort([{rand:uniform(), K} || K <- maps:keys(Conns)]),
 	find_available_connection_random(I, Conns, Tid);
