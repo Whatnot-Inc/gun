@@ -502,8 +502,6 @@ least_loaded_routing(Config) ->
 	%% Occupy one connection with a slow request.
 	{async, {BusyConn, _}} = gun_pool:get("/delay",
 		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
-	%% Wait for the stream count cast to reach the manager.
-	%% timer:sleep(100),
 	%% Send requests one at a time and await each before the next.
 	%% This keeps the idle connection at 0-1 streams, always below the
 	%% busy connection, so least_loaded must consistently pick it.
