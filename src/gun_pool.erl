@@ -813,7 +813,17 @@ find_available_connection(#state{lookup=#{strategy := random, table := Tid}, con
 	find_available_connection_random(I, Conns, Tid);
 find_available_connection(#state{lookup=#{strategy := least_loaded, available := Available},
 		conns=Conns}) ->
-	find_available_connection_iter(gb_trees:iterator(Available), Conns).
+	case gb_trees:is_empty(Available) of
+		true ->
+			none;
+		false ->
+			{{Count, ConnPid}, ConnPid} = gb_trees:smallest(Available),
+			{up, Protocol, Settings} = maps:get(ConnPid, Conns),
+			case Count < max_streams(Protocol, Settings) of
+				true -> ConnPid;
+				false -> none
+			end
+	end.
 
 find_available_connection_random([], _, _) ->
 	none;
@@ -835,23 +845,6 @@ find_available_connection_random([{_, ConnPid}|I], Conns, Tid) ->
 			end;
 		_ ->
 			find_available_connection_random(I, Conns, Tid)
-	end.
-
-find_available_connection_iter(Iter0, Conns) ->
-	case gb_trees:next(Iter0) of
-		none ->
-			none;
-		{{Count, ConnPid}, _, Iter} ->
-			case maps:get(ConnPid, Conns) of
-				{up, Protocol, Settings} ->
-					MaxStreams = max_streams(Protocol, Settings),
-					case Count < MaxStreams of
-						true -> ConnPid;
-						false -> find_available_connection_iter(Iter, Conns)
-					end;
-				_ ->
-					find_available_connection_iter(Iter, Conns)
-			end
 	end.
 
 max_streams(http, _) ->
