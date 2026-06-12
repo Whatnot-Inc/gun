@@ -697,53 +697,19 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 		}
 	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
-handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _,
-		StateData=#state{lookup=#{strategy := random} = Lookup, host=Host, port=Port, opts=Opts,
-				conns=Conns0, conns_meta=ConnsMeta0}) ->
-	Conns = maps:remove(ConnPid0, Conns0),
-	ConnsMeta = maps:remove(ConnPid0, ConnsMeta0),
+handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _, StateData0) ->
+	StateData=#state{host=Host, port=Port, opts=Opts, lookup=Lookup, conns=Conns}
+		= remove_down_conn(ConnPid0, StateData0),
 	case Reason of
 		%% The process is down because of a configuration error.
 		%% Do NOT attempt to reconnect, leave the pool in a degraded state.
 		badarg ->
-			{next_state, degraded, StateData#state{conns=Conns, conns_meta=ConnsMeta}};
+			{next_state, degraded, StateData};
 		_ ->
 			ConnOpts = conn_opts(Lookup, Opts),
 			{ok, ConnPid} = gun:open(Host, Port, ConnOpts),
 			_ = monitor(process, ConnPid),
-			{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}, conns_meta=ConnsMeta}}
-	end;
-handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _,
-		StateData=#state{lookup=#{strategy := least_loaded, available := Available0,
-				stream_counts := StreamCounts0, up_count := UpCount0} = Lookup,
-				host=Host, port=Port, opts=Opts, conns=Conns0, conns_meta=ConnsMeta0}) ->
-	WasUp = case maps:get(ConnPid0, Conns0) of
-		{up, _, _} -> true;
-		_ -> false
-	end,
-	OldCount = maps:get(ConnPid0, StreamCounts0, 0),
-	Conns = maps:remove(ConnPid0, Conns0),
-	ConnsMeta = maps:remove(ConnPid0, ConnsMeta0),
-	Available = case WasUp of
-		true -> gb_trees:delete({OldCount, ConnPid0}, Available0);
-		false -> Available0
-	end,
-	StreamCounts = maps:remove(ConnPid0, StreamCounts0),
-	UpCount = case WasUp of true -> UpCount0 - 1; false -> UpCount0 end,
-	StateData1 = StateData#state{
-		conns=Conns, conns_meta=ConnsMeta,
-		lookup=Lookup#{available => Available, stream_counts => StreamCounts, up_count => UpCount}
-	},
-	case Reason of
-		%% The process is down because of a configuration error.
-		%% Do NOT attempt to reconnect, leave the pool in a degraded state.
-		badarg ->
-			{next_state, degraded, StateData1};
-		_ ->
-			ConnOpts = conn_opts(Lookup, Opts),
-			{ok, ConnPid} = gun:open(Host, Port, ConnOpts),
-			_ = monitor(process, ConnPid),
-			{next_state, degraded, StateData1#state{conns=Conns#{ConnPid => down}}}
+			{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}}
 	end;
 handle_common({call, From}, info, StateName, #state{host=Host, port=Port,
 		opts=Opts, lookup=Lookup, conns=Conns, conns_meta=ConnsMeta}) ->
@@ -765,6 +731,33 @@ handle_common(Type, Event, StateName, StateData) ->
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 
+remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random},
+		conns=Conns, conns_meta=ConnsMeta}) ->
+	StateData#state{
+		conns=maps:remove(ConnPid, Conns),
+		conns_meta=maps:remove(ConnPid, ConnsMeta)
+	};
+remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
+		available := Available, stream_counts := StreamCounts, up_count := UpCount} = Lookup,
+		conns=Conns, conns_meta=ConnsMeta}) ->
+	WasUp = case maps:get(ConnPid, Conns) of
+		{up, _, _} -> true;
+		_ -> false
+	end,
+	OldCount = maps:get(ConnPid, StreamCounts, 0),
+	StateData#state{
+		conns=maps:remove(ConnPid, Conns),
+		conns_meta=maps:remove(ConnPid, ConnsMeta),
+		lookup=Lookup#{
+			available => case WasUp of
+				true -> gb_trees:delete({OldCount, ConnPid}, Available);
+				false -> Available
+			end,
+			stream_counts => maps:remove(ConnPid, StreamCounts),
+			up_count => case WasUp of true -> UpCount - 1; false -> UpCount end
+		}
+	}.
+
 claim_connection(_ConnPid, StateData=#state{lookup=#{strategy := random}}) ->
 	StateData;
 claim_connection(ConnPid, StateData=#state{lookup=#{strategy := least_loaded}, conns=Conns}) ->
@@ -785,6 +778,9 @@ adjust_stream_count(ConnPid, Delta, StateData=#state{
 				available => Available,
 				stream_counts => StreamCounts#{ConnPid => NewCount}
 			}};
+		%% The connection may have already gone down and been cleaned up by
+		%% remove_down_conn (which drops its stream count) by the time a
+		%% release_stream is handled. Ignore it instead of crashing.
 		error ->
 			StateData
 	end.
