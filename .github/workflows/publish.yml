@@ -1,0 +1,120 @@
+name: Publish
+
+# Builds the hex tarball with Erlang.mk (`make hex-tarball-create`) and uploads
+# it to Whatnot's JFrog whatnot_hex repo, then tags the released version.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      JFROG_REPO: whatnot_hex
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.CI_BOT_ACCESS_TOKEN }}
+
+      - name: Set up Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          version-type: loose
+
+      - name: Extract package metadata
+        id: meta
+        run: |
+          APP=$(grep -m1 '^PROJECT[[:space:]]*=' Makefile | sed 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]')
+          VERSION=$(grep -m1 '^PROJECT_VERSION[[:space:]]*=' Makefile | sed 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]')
+          if [ -z "$APP" ] || [ -z "$VERSION" ]; then
+            echo "Could not determine PROJECT/PROJECT_VERSION from Makefile" >&2
+            exit 1
+          fi
+          echo "app=${APP}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if already tagged
+        id: tag-check
+        run: |
+          if git tag --list "v${{ steps.meta.outputs.version }}" | grep -q .; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.meta.outputs.version }} already tagged — skipping publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build hex tarball
+        if: steps.tag-check.outputs.skip != 'true'
+        id: build
+        run: |
+          make
+          make hex-tarball-create
+          ARTIFACT="${{ steps.meta.outputs.app }}-${{ steps.meta.outputs.version }}.tar"
+          cp ".erlang.mk/${{ steps.meta.outputs.app }}.tar" "${ARTIFACT}"
+          echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup JFrog CLI
+        if: steps.tag-check.outputs.skip != 'true'
+        uses: jfrog/setup-jfrog-cli@v5
+        with:
+          disable-auto-build-publish: true
+        env:
+          JF_URL: https://whatnot.jfrog.io
+          JF_USER: hex_ci
+          JF_PASSWORD: ${{ secrets.JFROG_HEX_UPLOAD_TOKEN }}
+
+      - name: Check if artifact already exists in JFrog
+        if: steps.tag-check.outputs.skip != 'true'
+        id: jfrog-check
+        run: |
+          ARTIFACT="${{ steps.build.outputs.artifact }}"
+          SEARCH_RESULT=$(jf rt search "${JFROG_REPO}/tarballs/${ARTIFACT}")
+          if [ "$SEARCH_RESULT" != "[]" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${ARTIFACT} already exists in JFrog — skipping upload"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to JFrog
+        if: steps.tag-check.outputs.skip != 'true' && steps.jfrog-check.outputs.exists != 'true'
+        run: jf rt upload "${{ steps.build.outputs.artifact }}" "${JFROG_REPO}/tarballs/" --flat=true
+
+      - name: Create and push git tag
+        id: tag-push
+        if: steps.tag-check.outputs.skip != 'true'
+        run: |
+          git config user.name whatnot-ci-bot
+          git config user.email whatnot-ci-bot@whatnot.com
+          git tag "v${{ steps.meta.outputs.version }}" "${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}"
+          git push origin "v${{ steps.meta.outputs.version }}"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          if [ -z "${VERSION}" ]; then
+            echo "## Publish skipped — could not extract version" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.tag-check.outputs.skip }}" = "true" ]; then
+            echo "## v${VERSION} already tagged — skipped" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.tag-push.outcome }}" = "success" ]; then
+            if [ "${{ steps.jfrog-check.outputs.exists }}" = "true" ]; then
+              echo "## v${VERSION} tagged (artifact was already in \`${JFROG_REPO}\`)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "## Published v${VERSION} to \`${JFROG_REPO}\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "Artifact: \`${{ steps.build.outputs.artifact }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Publish failed for v${VERSION} — see failed steps above" >> "$GITHUB_STEP_SUMMARY"
+          fi

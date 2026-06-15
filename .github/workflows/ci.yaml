@@ -1,21 +1,67 @@
-## Use workflows from ninenines/ci.erlang.mk to test Gun.
-
-name: Check Gun
+name: CI
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   pull_request:
-  schedule:
-      ## Every Monday at 2am.
-      - cron: 0 2 * * 1
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  check:
-    name: Check
-    uses: ninenines/ci.erlang.mk/.github/workflows/ci.yaml@master
+  # Common Test suite
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          version-type: loose
+          install-rebar: false
+          install-hex: false
+
+      - name: Set up Go
+        # Gun's HTTP/2 suites build summerwind/h2spec (h2specd) during test-build.
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Run Common Test suite
+        run: make ct
+
+      - name: Upload CT logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ct-logs
+          path: logs/
+          if-no-files-found: ignore
+
+  # Static analysis via Dialyzer 
+  dialyze:
+    name: Dialyzer
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          version-type: loose
+          install-rebar: false
+          install-hex: false
+
+      - name: Run Dialyzer
+        run: make dialyze
