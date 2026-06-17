@@ -40,8 +40,14 @@ AUTO_CI_WINDOWS ?= OTP-LATEST-24+
 
 # Hex configuration.
 
+# Publish the fork under a distinct hex package name to differentiate it from
+# upstream `gun` on hex.pm. The OTP application name stays `gun`, in order to
+# avoid issues with other dependencies that rely on `gun`.
+HEX_PACKAGE_NAME = whatnot_gun
+
 define HEX_TARBALL_EXTRA_METADATA
 #{
+	name => <<"$(HEX_PACKAGE_NAME)">>,
 	licenses => [<<"ISC">>],
 	links => #{
 		<<"Function reference">> => <<"https://ninenines.eu/docs/en/gun/2.4/manual/">>,

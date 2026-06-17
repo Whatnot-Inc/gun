@@ -40,7 +40,10 @@ jobs:
             echo "Could not determine PROJECT/PROJECT_VERSION from Makefile" >&2
             exit 1
           fi
+          PACKAGE=$(grep -m1 '^HEX_PACKAGE_NAME[[:space:]]*=' Makefile | sed 's/^[^=]*=[[:space:]]*//' | tr -d '[:space:]')
+          PACKAGE=${PACKAGE:-$APP}
           echo "app=${APP}" >> "$GITHUB_OUTPUT"
+          echo "package=${PACKAGE}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Check if already tagged
@@ -59,7 +62,7 @@ jobs:
         run: |
           make
           make hex-tarball-create
-          ARTIFACT="${{ steps.meta.outputs.app }}-${{ steps.meta.outputs.version }}.tar"
+          ARTIFACT="${{ steps.meta.outputs.package }}-${{ steps.meta.outputs.version }}.tar"
           cp ".erlang.mk/${{ steps.meta.outputs.app }}.tar" "${ARTIFACT}"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
 
