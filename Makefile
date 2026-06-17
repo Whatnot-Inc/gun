@@ -1,8 +1,16 @@
 # See LICENSE for licensing information.
 
-PROJECT = gun
+PROJECT = whatnot_gun
 PROJECT_DESCRIPTION = HTTP/1.1, HTTP/2 and Websocket client for Erlang/OTP.
-PROJECT_VERSION = 2.4.1
+PROJECT_VERSION = 2.4.2
+
+# The OTP application is renamed to whatnot_gun for the Whatnot fork, but the
+# modules, application callback, and supervisor keep their upstream `gun_*`
+# names. Because the app name no longer matches the module prefix, erlang.mk
+# can't auto-detect these (it looks for src/$(PROJECT)_app.erl), so set them
+# explicitly to preserve `{mod, {gun_app, []}}` and `{registered, [gun_sup]}`.
+PROJECT_MOD = gun_app
+PROJECT_REGISTERED = gun_sup
 
 # Options.
 
@@ -39,15 +47,8 @@ AUTO_CI_OTP ?= OTP-LATEST-24+
 AUTO_CI_WINDOWS ?= OTP-LATEST-24+
 
 # Hex configuration.
-
-# Publish the fork under a distinct hex package name to differentiate it from
-# upstream `gun` on hex.pm. The OTP application name stays `gun`, in order to
-# avoid issues with other dependencies that rely on `gun`.
-HEX_PACKAGE_NAME = whatnot_gun
-
 define HEX_TARBALL_EXTRA_METADATA
 #{
-	name => <<"$(HEX_PACKAGE_NAME)">>,
 	licenses => [<<"ISC">>],
 	links => #{
 		<<"Function reference">> => <<"https://ninenines.eu/docs/en/gun/2.4/manual/">>,
