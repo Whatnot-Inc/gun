@@ -17,6 +17,6 @@
 -export([init/2]).
 
 init(_, _) ->
-	ct_helper:start([cowboy, gun]),
+	ct_helper:start([cowboy, whatnot_gun]),
 	ct_helper:make_certs_in_ets(),
 	{ok, undefined}.
