@@ -42,7 +42,7 @@ groups() ->
 		degraded_configuration_error
 	],
 	[{random, [], Tests},
-	 {least_loaded, [], Tests ++ [least_loaded_routing]}].
+	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin]}].
 
 init_per_suite(Config) ->
 	{ok, _} = cowboy:start_clear({?MODULE, tcp}, [], do_proto_opts()),
@@ -513,3 +513,48 @@ least_loaded_routing(Config) ->
 		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
 		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef)
 	end || _ <- lists:seq(1, 10)].
+
+least_loaded_round_robin(Config) ->
+	doc("Confirm the least_loaded strategy rotates across equally-loaded "
+		"connections: with 5 connections and 5 sequential requests, every 
+		connection is used exactly once."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	Size = 5,
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => Size
+	}),
+	gun_pool:await_up(ManagerPid),
+
+	ConnPids = [begin
+		{async, {ConnPid, _} = PoolStreamRef} = gun_pool:get("/",
+			#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
+		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
+		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
+		%% The stream is released asynchronously (the event handler casts
+		%% {release_stream, _} to the manager), so wait until every connection
+		%% is back to 0 streams before issuing the next request.
+		ok = wait_all_streams_released(ManagerPid),
+		ConnPid
+	end || _ <- lists:seq(1, Size)],
+	%% Every connection must have been used exactly once.
+	Size = length(lists:usort(ConnPids)).
+
+%% Poll the manager until every connection's stream count is back to 0.
+wait_all_streams_released(ManagerPid) ->
+	wait_all_streams_released(ManagerPid, 100).
+
+wait_all_streams_released(_ManagerPid, 0) ->
+	{error, timeout};
+wait_all_streams_released(ManagerPid, N) ->
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	case lists:all(fun(Count) -> Count =:= 0 end, maps:values(StreamCounts)) of
+		true ->
+			ok;
+		false ->
+			timer:sleep(10),
+			wait_all_streams_released(ManagerPid, N - 1)
+	end.
