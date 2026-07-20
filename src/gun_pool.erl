@@ -153,7 +153,9 @@
 	await_up = [] :: [{pid(), any()}],
 	lookup :: #{strategy := random, table := ets:tid()}
 	        | #{strategy := least_loaded, available := gb_trees:tree(),
-	            stream_counts := #{pid() => non_neg_integer()}, up_count := non_neg_integer()}
+	            stream_counts := #{pid() => non_neg_integer()},
+	            seqs := #{pid() => non_neg_integer()}, next_seq := non_neg_integer(),
+	            up_count := non_neg_integer()}
 }).
 
 %% Pool management.
@@ -533,7 +535,8 @@ init({Host, Port, Opts}) ->
 			#{strategy => random, table => Tid};
 		least_loaded ->
 		#{strategy => least_loaded, available => gb_trees:empty(),
-			stream_counts => #{}, up_count => 0, manager_pid => self()}
+			stream_counts => #{}, seqs => #{}, next_seq => 0,
+			up_count => 0, manager_pid => self()}
 	end,
 	ConnOpts = conn_opts(Lookup, Opts),
 	Conns = maps:from_list([begin
@@ -642,10 +645,13 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 add_up_connection(_ConnPid, Lookup=#{strategy := random}) ->
 	Lookup;
 add_up_connection(ConnPid, Lookup=#{strategy := least_loaded,
-		available := Available, stream_counts := StreamCounts, up_count := UpCount}) ->
+		available := Available, stream_counts := StreamCounts,
+		seqs := Seqs, next_seq := Seq, up_count := UpCount}) ->
 	Lookup#{
-		available => gb_trees:insert({0, ConnPid}, ConnPid, Available),
+		available => gb_trees:insert({0, Seq}, ConnPid, Available),
 		stream_counts => StreamCounts#{ConnPid => 0},
+		seqs => Seqs#{ConnPid => Seq},
+		next_seq => Seq + 1,
 		up_count => UpCount + 1
 	}.
 
@@ -685,14 +691,16 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 	{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 		StateData=#state{lookup=#{strategy := least_loaded, available := Available,
-				stream_counts := StreamCounts, up_count := UpCount} = Lookup, conns=Conns}) ->
+				stream_counts := StreamCounts, seqs := Seqs, up_count := UpCount} = Lookup, conns=Conns}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
 	OldCount = maps:get(ConnPid, StreamCounts, 0),
+	OldSeq = maps:get(ConnPid, Seqs),
 	{next_state, degraded, StateData#state{
 		conns=Conns#{ConnPid => down},
 		lookup=Lookup#{
-			available => gb_trees:delete({OldCount, ConnPid}, Available),
+			available => gb_trees:delete({OldCount, OldSeq}, Available),
 			stream_counts => maps:remove(ConnPid, StreamCounts),
+			seqs => maps:remove(ConnPid, Seqs),
 			up_count => UpCount - 1
 		}
 	}};
@@ -738,7 +746,8 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random},
 		conns_meta=maps:remove(ConnPid, ConnsMeta)
 	};
 remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
-		available := Available, stream_counts := StreamCounts, up_count := UpCount} = Lookup,
+		available := Available, stream_counts := StreamCounts,
+		seqs := Seqs, up_count := UpCount} = Lookup,
 		conns=Conns, conns_meta=ConnsMeta}) ->
 	WasUp = case maps:get(ConnPid, Conns) of
 		{up, _, _} -> true;
@@ -750,10 +759,11 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
 		conns_meta=maps:remove(ConnPid, ConnsMeta),
 		lookup=Lookup#{
 			available => case WasUp of
-				true -> gb_trees:delete({OldCount, ConnPid}, Available);
+				true -> gb_trees:delete({OldCount, maps:get(ConnPid, Seqs)}, Available);
 				false -> Available
 			end,
 			stream_counts => maps:remove(ConnPid, StreamCounts),
+			seqs => maps:remove(ConnPid, Seqs),
 			up_count => case WasUp of true -> UpCount - 1; false -> UpCount end
 		}
 	}.
@@ -768,15 +778,23 @@ claim_connection(ConnPid, StateData=#state{lookup=#{strategy := least_loaded}, c
 	end.
 
 adjust_stream_count(ConnPid, Delta, StateData=#state{
-		lookup=#{available := Available0, stream_counts := StreamCounts} = Lookup}) ->
+		lookup=#{available := Available0, stream_counts := StreamCounts,
+			seqs := Seqs, next_seq := Seq} = Lookup}) ->
 	case maps:find(ConnPid, StreamCounts) of
 		{ok, OldCount} ->
 			NewCount = OldCount + Delta,
-			Available1 = gb_trees:delete({OldCount, ConnPid}, Available0),
-			Available = gb_trees:insert({NewCount, ConnPid}, ConnPid, Available1),
+			OldSeq = maps:get(ConnPid, Seqs),
+			%% Assign a fresh sequence number so the just-used connection
+			%% sinks to the back of its stream-count bucket. This rotates
+			%% selection across equally-loaded connections instead of
+			%% always favouring the same (e.g. lowest-pid) subset.
+			Available1 = gb_trees:delete({OldCount, OldSeq}, Available0),
+			Available = gb_trees:insert({NewCount, Seq}, ConnPid, Available1),
 			StateData#state{lookup=Lookup#{
 				available => Available,
-				stream_counts => StreamCounts#{ConnPid => NewCount}
+				stream_counts => StreamCounts#{ConnPid => NewCount},
+				seqs => Seqs#{ConnPid => Seq},
+				next_seq => Seq + 1
 			}};
 		%% The connection may have already gone down and been cleaned up by
 		%% remove_down_conn (which drops its stream count) by the time a
@@ -808,7 +826,7 @@ find_available_connection(#state{lookup=#{strategy := least_loaded, available :=
 		true ->
 			none;
 		false ->
-			{{Count, ConnPid}, ConnPid} = gb_trees:smallest(Available),
+			{{Count, _Seq}, ConnPid} = gb_trees:smallest(Available),
 			{up, Protocol, Settings} = maps:get(ConnPid, Conns),
 			case Count < max_streams(Protocol, Settings) of
 				true -> ConnPid;
