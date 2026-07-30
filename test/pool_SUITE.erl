@@ -39,10 +39,17 @@ groups() ->
 		reconnect_h1,
 		reconnect_h2,
 		stop_pool,
-		degraded_configuration_error
+		degraded_configuration_error,
+		checkout_deadline_expired,
+		checkout_deadline_future
 	],
-	[{random, [], Tests},
-	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin]}].
+	[{random, [], Tests ++ [random_release_noop]},
+	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin,
+		least_loaded_priority_release, least_loaded_release_restores_capacity,
+		least_loaded_release_duplicate_no_underflow,
+		least_loaded_release_stale_duplicate_does_not_erase_live_claim,
+		least_loaded_release_after_stream_completion_is_noop,
+		least_loaded_claim_consumed_for_divergent_reply_to]}].
 
 init_per_suite(Config) ->
 	{ok, _} = cowboy:start_clear({?MODULE, tcp}, [], do_proto_opts()),
@@ -511,7 +518,11 @@ least_loaded_routing(Config) ->
 			#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
 		true = ConnPid =/= BusyConn,
 		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
-		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef)
+		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
+		%% Wait for this request's asynchronous release before issuing
+		%% the next one: with it still pending both connections sit at
+		%% one stream and the tie-break can route to the busy one.
+		ok = wait_stream_total(ManagerPid, 1)
 	end || _ <- lists:seq(1, 10)].
 
 least_loaded_round_robin(Config) ->
@@ -543,6 +554,222 @@ least_loaded_round_robin(Config) ->
 	%% Every connection must have been used exactly once.
 	Size = length(lists:usort(ConnPids)).
 
+least_loaded_priority_release(Config) ->
+	doc("Confirm least_loaded stream releases overtake queued ordinary messages and update the manager."),
+	ReleaseAlias = alias([priority]),
+	StreamRef = make_ref(),
+	Receiver = self(),
+	ReplyTo = self(),
+	_ = spawn(fun() ->
+		Receiver ! ordinary_sentinel,
+		Receiver ! ordinary_sentinel_enqueued
+	end),
+	receive
+		ordinary_sentinel_enqueued -> ok
+	end,
+	PrioritySender = spawn(fun() ->
+		_ = gun_pool_events_h:request_end(#{stream_ref => StreamRef}, #{
+			strategy => least_loaded,
+			release_to => ReleaseAlias,
+			StreamRef => {nofin, fin, ReplyTo}
+		}),
+		Receiver ! priority_release_enqueued
+	end),
+	receive
+		priority_release_enqueued -> ok
+	end,
+	receive
+		{release_stream, PrioritySender, ReplyTo} -> ok;
+		ordinary_sentinel -> ct:fail(priority_release_not_prioritized)
+	end,
+	_ = unalias(ReleaseAlias),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{operational, #{lookup := #{release_alias := ManagerReleaseAlias}}} = gun_pool:info(ManagerPid),
+	true = is_reference(ManagerReleaseAlias),
+	{async, PoolStreamRef} = gun_pool:get("/", #{<<"host">> => Authority}, #{
+		scope => scope(?FUNCTION_NAME, Config)
+	}),
+	{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
+	ok = wait_all_streams_released(ManagerPid).
+
+least_loaded_release_restores_capacity(Config) ->
+	doc("Confirm gun_pool:release/1 restores checkout capacity for a "
+		"least_loaded connection that was claimed but never used, "
+		"for example when the caller's own deadline expired before "
+		"issuing a request on the checked out connection."),
+	Port = config(port, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{ConnPid, Meta} = gun_pool:checkout(ManagerPid, #{}),
+	true = is_map_key(claim_ref, Meta),
+	undefined = gun_pool:checkout(ManagerPid, #{}),
+	ok = gun_pool:release(Meta),
+	{ConnPid, _Meta} = gun_pool:checkout(ManagerPid, #{}).
+
+least_loaded_release_duplicate_no_underflow(Config) ->
+	doc("Confirm a duplicate gun_pool:release/1 call for the same "
+		"connection does not underflow its stream count below zero "
+		"and leaves the pool usable."),
+	Port = config(port, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{ConnPid, Meta} = gun_pool:checkout(ManagerPid, #{}),
+	ok = gun_pool:release(Meta),
+	ok = gun_pool:release(Meta),
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	0 = maps:get(ConnPid, StreamCounts),
+	{ConnPid, _Meta} = gun_pool:checkout(ManagerPid, #{}).
+
+least_loaded_release_stale_duplicate_does_not_erase_live_claim(Config) ->
+	doc("Confirm a duplicate gun_pool:release/1 call for a claim already "
+		"consumed does not erase a different, live claim made on the "
+		"same connection in the meantime: the claims are tokens, matched "
+		"individually, not a single count matched by connection pid."),
+	Port = config(port, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{ConnPid, MetaA} = gun_pool:checkout(ManagerPid, #{}),
+	ok = gun_pool:release(MetaA),
+	{ConnPid, _MetaB} = gun_pool:checkout(ManagerPid, #{}),
+	%% Stale/duplicate: claim A's token was already consumed above.
+	ok = gun_pool:release(MetaA),
+	undefined = gun_pool:checkout(ManagerPid, #{}),
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	1 = maps:get(ConnPid, StreamCounts).
+
+least_loaded_release_after_stream_completion_is_noop(Config) ->
+	doc("Confirm a gun_pool:release/1 call for a claim already consumed "
+		"by ordinary end-of-stream bookkeeping does not erase a "
+		"different, live claim made on the same connection afterwards."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{ConnPid, MetaA} = gun_pool:checkout(ManagerPid, #{}),
+	%% The request must be complete (fin): an unfinished request body
+	%% makes the HTTP/1.1 connection unreusable and gun tears it down,
+	%% racing the assertions below against the reconnect.
+	StreamRef = gun:request(ConnPid, <<"GET">>, "/", #{<<"host">> => Authority}, <<>>),
+	{response, nofin, 200, _} = gun_pool:await({ConnPid, StreamRef}),
+	{ok, <<"Hello world!">>} = gun_pool:await_body({ConnPid, StreamRef}),
+	ok = wait_all_streams_released(ManagerPid),
+	{ConnPid, _MetaB} = gun_pool:checkout(ManagerPid, #{}),
+	%% Stale: claim A's token was already consumed when its stream ended.
+	ok = gun_pool:release(MetaA),
+	undefined = gun_pool:checkout(ManagerPid, #{}),
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	1 = maps:get(ConnPid, StreamCounts).
+
+least_loaded_claim_consumed_for_divergent_reply_to(Config) ->
+	doc("Confirm a stream whose reply_to differs from the checkout "
+		"caller still consumes its claim at end of stream, so the "
+		"claim cannot accumulate or fund a later stale release."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{ConnPid, MetaA} = gun_pool:checkout(ManagerPid, #{}),
+	ReplyTo = spawn(fun() -> receive stop -> ok end end),
+	_StreamRef = gun:request(ConnPid, <<"GET">>, "/",
+		#{<<"host">> => Authority}, <<>>, #{reply_to => ReplyTo}),
+	%% The response goes to ReplyTo; observe completion via the
+	%% manager's stream counts instead.
+	ok = wait_all_streams_released(ManagerPid),
+	{_, #{lookup := #{claims := Claims, claim_index := ClaimIndex}}}
+		= gun_pool:info(ManagerPid),
+	0 = map_size(Claims),
+	0 = map_size(ClaimIndex),
+	%% Stale: claim A must not be able to erase a live claim.
+	{ConnPid, _MetaB} = gun_pool:checkout(ManagerPid, #{}),
+	ok = gun_pool:release(MetaA),
+	undefined = gun_pool:checkout(ManagerPid, #{}),
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	1 = maps:get(ConnPid, StreamCounts),
+	ReplyTo ! stop,
+	ok.
+
+random_release_noop(Config) ->
+	doc("Confirm gun_pool:release/1 is an ok no-op for the random "
+		"strategy, which does not claim a connection at checkout time."),
+	Port = config(port, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => random,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{ConnPid, Meta} = gun_pool:checkout(ManagerPid, #{}),
+	false = is_map_key(release_to, Meta),
+	false = is_map_key(claim_ref, Meta),
+	ok = gun_pool:release(Meta).
+
+checkout_deadline_expired(Config) ->
+	doc("Confirm checkout with an already-expired checkout_deadline "
+		"returns undefined immediately without claiming a connection."),
+	Port = config(port, Config),
+	Strategy = config(lookup_strategy, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => Strategy,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	Deadline = erlang:monotonic_time(millisecond) - 1,
+	undefined = gun_pool:checkout(ManagerPid, #{checkout_deadline => Deadline}),
+	%% Nothing was claimed: a follow-up checkout still succeeds.
+	{_ConnPid, _Meta} = gun_pool:checkout(ManagerPid, #{}).
+
+checkout_deadline_future(Config) ->
+	doc("Confirm checkout with a checkout_deadline in the future "
+		"behaves like an ordinary checkout."),
+	Port = config(port, Config),
+	Strategy = config(lookup_strategy, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => Strategy,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	Deadline = erlang:monotonic_time(millisecond) + 5000,
+	{_ConnPid, _Meta} = gun_pool:checkout(ManagerPid, #{checkout_deadline => Deadline}).
+
 %% Poll the manager until every connection's stream count is back to 0.
 wait_all_streams_released(ManagerPid) ->
 	wait_all_streams_released(ManagerPid, 100).
@@ -551,10 +778,32 @@ wait_all_streams_released(_ManagerPid, 0) ->
 	{error, timeout};
 wait_all_streams_released(ManagerPid, N) ->
 	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
-	case lists:all(fun(Count) -> Count =:= 0 end, maps:values(StreamCounts)) of
+	%% The map_size check guards against a vacuous pass while every
+	%% connection is down (down conns lose their stream_counts entry).
+	case map_size(StreamCounts) > 0
+			andalso lists:all(fun(Count) -> Count =:= 0 end, maps:values(StreamCounts)) of
 		true ->
 			ok;
 		false ->
 			timer:sleep(10),
 			wait_all_streams_released(ManagerPid, N - 1)
+	end.
+
+%% Wait until the manager has processed enough end-of-stream releases
+%% that the total stream count equals Total. Needed because releases
+%% arrive asynchronously from the connection processes: awaiting a
+%% response does not guarantee the manager's counts reflect it yet.
+wait_stream_total(ManagerPid, Total) ->
+	wait_stream_total(ManagerPid, Total, 100).
+
+wait_stream_total(_ManagerPid, _Total, 0) ->
+	{error, timeout};
+wait_stream_total(ManagerPid, Total, N) ->
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	case lists:sum(maps:values(StreamCounts)) of
+		Total ->
+			ok;
+		_ ->
+			timer:sleep(10),
+			wait_stream_total(ManagerPid, Total, N - 1)
 	end.

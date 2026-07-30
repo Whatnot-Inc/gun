@@ -69,9 +69,9 @@ request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := random, tabl
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME);
-request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := least_loaded}) ->
+request_start(Event=#{stream_ref := StreamRef, reply_to := ReplyTo}, State=#{strategy := least_loaded}) ->
 	propagate(Event, State#{
-		StreamRef => {nofin, nofin}
+		StreamRef => {nofin, nofin, ReplyTo}
 	}, ?FUNCTION_NAME).
 
 request_headers(Event, State) ->
@@ -86,13 +86,13 @@ request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, table
 			State0#{StreamRef => {fin, IsFin}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME);
-request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, manager := Manager}) ->
+request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, release_to := ReleaseTo}) ->
 	State = case State0 of
-		#{StreamRef := {nofin, fin}} ->
-			gen_statem:cast(Manager, {release_stream, self()}),
+		#{StreamRef := {nofin, fin, ReplyTo}} ->
+			erlang:send(ReleaseTo, {release_stream, self(), ReplyTo}, [priority]),
 			maps:remove(StreamRef, State0);
-		#{StreamRef := {nofin, IsFin}} ->
-			State0#{StreamRef => {fin, IsFin}}
+		#{StreamRef := {nofin, IsFin, ReplyTo}} ->
+			State0#{StreamRef => {fin, IsFin, ReplyTo}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME).
 
@@ -123,13 +123,13 @@ response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, tabl
 			State0#{StreamRef => {IsFin, fin}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME);
-response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, manager := Manager}) ->
+response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, release_to := ReleaseTo}) ->
 	State = case State0 of
-		#{StreamRef := {fin, nofin}} ->
-			gen_statem:cast(Manager, {release_stream, self()}),
+		#{StreamRef := {fin, nofin, ReplyTo}} ->
+			erlang:send(ReleaseTo, {release_stream, self(), ReplyTo}, [priority]),
 			maps:remove(StreamRef, State0);
-		#{StreamRef := {IsFin, nofin}} ->
-			State0#{StreamRef => {IsFin, fin}}
+		#{StreamRef := {IsFin, nofin, ReplyTo}} ->
+			State0#{StreamRef => {IsFin, fin, ReplyTo}}
 	end,
 	propagate(Event, State, ?FUNCTION_NAME).
 
@@ -169,7 +169,7 @@ disconnect(Event, State=#{strategy := random, table := Tid}) ->
 	end,
 	propagate(Event, maps:with([event_handler, strategy, table], State), ?FUNCTION_NAME);
 disconnect(Event, State=#{strategy := least_loaded}) ->
-	propagate(Event, maps:with([event_handler, strategy, manager], State), ?FUNCTION_NAME).
+	propagate(Event, maps:with([event_handler, strategy, release_to], State), ?FUNCTION_NAME).
 
 terminate(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).

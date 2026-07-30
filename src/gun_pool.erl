@@ -26,6 +26,7 @@
 -export([await_up/1]).
 -export([await_up/2]).
 -export([checkout/2]). %% Use responsibly!
+-export([release/1]).
 
 %% Requests.
 -export([delete/2]).
@@ -124,6 +125,8 @@
 
 	%% Options specific to pools.
 	checkout_call_timeout => timeout(),
+	%% Absolute, in erlang:monotonic_time(millisecond) units.
+	checkout_deadline => integer(),
 	checkout_retry => [pos_integer()],
 	scope => any(),
 	start_pool_if_missing => boolean()
@@ -144,6 +147,10 @@
 %% @todo tunnel
 -type meta() :: #{pid() => #{ws => gun:stream_ref()}}.
 
+%% Returned by checkout/2.
+-type checkout_meta() :: map().
+-export_type([checkout_meta/0]).
+
 -record(state, {
 	host :: inet:hostname() | inet:ip_address(),
 	port :: inet:port_number(),
@@ -155,7 +162,9 @@
 	        | #{strategy := least_loaded, available := gb_trees:tree(),
 	            stream_counts := #{pid() => non_neg_integer()},
 	            seqs := #{pid() => non_neg_integer()}, next_seq := non_neg_integer(),
-	            up_count := non_neg_integer()}
+	            up_count := non_neg_integer(), release_alias := reference(),
+	            claims := #{reference() => {pid(), pid()}},
+	            claim_index := #{{pid(), pid()} => [reference()]}}
 }).
 
 %% Pool management.
@@ -226,7 +235,7 @@ await_up(Authority, Scope) ->
 			gen_statem:call(ManagerPid, await_up, 5000)
 	end.
 
--spec checkout(pid(), req_opts() | ws_send_opts()) -> undefined | {pid(), map()}.
+-spec checkout(pid(), req_opts() | ws_send_opts()) -> undefined | {pid(), checkout_meta()}.
 checkout(ManagerPid, ReqOpts=#{checkout_retry := Retry}) when is_list(Retry) ->
 	CallTimeout = maps:get(checkout_call_timeout, ReqOpts, 5000),
 	case gen_server:call(ManagerPid, {checkout, ReqOpts}, CallTimeout) of
@@ -253,6 +262,21 @@ checkout_retry(ManagerPid, ReqOpts, CallTimeout, [Wait|Retry]) ->
 		Result ->
 			Result
 	end.
+
+%% Give back a checked out connection without issuing a request on it.
+%% Without an explicit release a least_loaded claim would leak: claims
+%% are made at checkout time and normally released only by end-of-stream
+%% events. No-op for the random strategy, which claims nothing.
+%%
+%% The release is a priority message rather than a call: a call would
+%% park the caller behind the very checkout backlog that made it
+%% abandon the connection in the first place.
+-spec release(checkout_meta()) -> ok.
+release(#{release_to := ReleaseTo, claim_ref := ClaimRef}) ->
+	_ = erlang:send(ReleaseTo, {release, ClaimRef}, [priority]),
+	ok;
+release(Meta) when is_map(Meta) ->
+	ok.
 
 %% Requests.
 
@@ -496,13 +520,20 @@ ws_send(Frames, WsSendOpts=#{authority := Authority}) ->
 %% active streams. For the random strategy it writes stream counts
 %% directly to the gun_pooled_conns ETS table (which is public).
 %% For the least_loaded strategy the manager itself claims a
-%% connection (incrementing its stream count) at checkout time, and
-%% the event handler casts {release_stream, ConnPid} to the manager when
-%% a stream completes, which decrements the count. The manager updates
-%% the gb_tree index and stream counts map accordingly. Claiming at checkout time
-%% avoids a race condition where the same connection would be handed
-%% out repeatedly before the event handler reported the newly opened
+%% connection (incrementing its stream count and minting a claim
+%% token) at checkout time, and the event handler sends
+%% {release_stream, ConnPid, ReplyTo} to the manager when a stream
+%% completes, which consumes a token for that {ConnPid, ReplyTo} pair
+%% and decrements the count. The manager updates the gb_tree index and
+%% stream counts map accordingly. Claiming at checkout time avoids a
+%% race condition where the same connection would be handed out
+%% repeatedly before the event handler reported the newly opened
 %% stream.
+%%
+%% release/2 and the checkout_deadline request option exist because
+%% claims are made at checkout time: an abandoned checkout would
+%% otherwise leak its claim, and a checkout processed after its
+%% caller stopped waiting would claim for nobody.
 %%
 %% A connection is deemed suitable if it is possible to open new
 %% streams. How many streams can be open at any one time depends
@@ -536,7 +567,8 @@ init({Host, Port, Opts}) ->
 		least_loaded ->
 		#{strategy => least_loaded, available => gb_trees:empty(),
 			stream_counts => #{}, seqs => #{}, next_seq => 0,
-			up_count => 0, manager_pid => self()}
+			up_count => 0, release_alias => alias([priority]),
+			claims => #{}, claim_index => #{}}
 	end,
 	ConnOpts = conn_opts(Lookup, Opts),
 	Conns = maps:from_list([begin
@@ -573,14 +605,14 @@ conn_opts(#{strategy := random, table := Tid}, Opts) ->
 			notify_settings_changed => true
 		}
 	};
-conn_opts(#{strategy := least_loaded, manager_pid := ManagerPid}, Opts) ->
+conn_opts(#{strategy := least_loaded, release_alias := ReleaseAlias}, Opts) ->
 	ConnOpts = maps:get(conn_opts, Opts, #{}),
 	EventHandlerState = maps:with([event_handler], ConnOpts),
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
 			strategy => least_loaded,
-			manager => ManagerPid
+			release_to => ReleaseAlias
 		}},
 		http2_opts => H2Opts#{
 			notify_settings_changed => true
@@ -666,21 +698,22 @@ is_degraded(#state{lookup=#{strategy := least_loaded, up_count := UpCount}, conn
 operational(Type, Event, StateData) ->
 	handle_common(Type, Event, ?FUNCTION_NAME, StateData).
 
-handle_common({call, From}, {checkout, _ReqOpts}, _,
-		StateData=#state{conns_meta=ConnsMeta}) ->
-	case find_available_connection(StateData) of
-		none ->
+handle_common({call, From}, {checkout, ReqOpts}, _, StateData) ->
+	case checkout_deadline_passed(ReqOpts) of
+		true ->
+			%% Never claim for a caller that may have stopped waiting.
 			{keep_state_and_data, {reply, From, undefined}};
-		ConnPid ->
-			Meta = maps:get(ConnPid, ConnsMeta, #{}),
-			%% We claim the connection immediately to avoid handing
-			%% out the same connection repeatedly before the stream
-			%% it will carry is reflected in the stream counts.
-			{keep_state, claim_connection(ConnPid, StateData),
-				{reply, From, {ConnPid, Meta}}}
+		false ->
+			handle_checkout(From, StateData)
 	end;
-handle_common(cast, {release_stream, ConnPid}, _, StateData) ->
-	{keep_state, adjust_stream_count(ConnPid, -1, StateData)};
+%% Only least_loaded pools create the release alias, so an explicit
+%% release cannot arrive for the random strategy.
+handle_common(info, {release, ClaimRef}, _, StateData=#state{
+		lookup=#{strategy := least_loaded}}) ->
+	{keep_state, consume_claim(ClaimRef, StateData)};
+handle_common(info, {release_stream, ConnPid, ReplyTo}, _, StateData) ->
+	{keep_state, adjust_stream_count(ConnPid, -1,
+		consume_claim_for({ConnPid, ReplyTo}, StateData))};
 handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
@@ -697,12 +730,12 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 	OldSeq = maps:get(ConnPid, Seqs),
 	{next_state, degraded, StateData#state{
 		conns=Conns#{ConnPid => down},
-		lookup=Lookup#{
+		lookup=prune_claims(ConnPid, Lookup#{
 			available => gb_trees:delete({OldCount, OldSeq}, Available),
 			stream_counts => maps:remove(ConnPid, StreamCounts),
 			seqs => maps:remove(ConnPid, Seqs),
 			up_count => UpCount - 1
-		}
+		})
 	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
 handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _, StateData0) ->
@@ -739,6 +772,31 @@ handle_common(Type, Event, StateName, StateData) ->
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 
+checkout_deadline_passed(#{checkout_deadline := Deadline}) ->
+	erlang:monotonic_time(millisecond) >= Deadline;
+checkout_deadline_passed(_ReqOpts) ->
+	false.
+
+handle_checkout(From={CallerPid, _Tag}, StateData) ->
+	case find_available_connection(StateData) of
+		none ->
+			{keep_state_and_data, {reply, From, undefined}};
+		ConnPid ->
+			%% We claim the connection immediately to avoid handing
+			%% out the same connection repeatedly before the stream
+			%% it will carry is reflected in the stream counts.
+			{ClaimRef, StateData1} = claim_connection(ConnPid, CallerPid, StateData),
+			{keep_state, StateData1,
+				{reply, From, {ConnPid, checkout_meta(ConnPid, ClaimRef, StateData1)}}}
+	end.
+
+checkout_meta(ConnPid, ClaimRef, #state{conns_meta=ConnsMeta,
+		lookup=#{strategy := least_loaded, release_alias := ReleaseAlias}}) ->
+	Meta = maps:get(ConnPid, ConnsMeta, #{}),
+	Meta#{release_to => ReleaseAlias, claim_ref => ClaimRef};
+checkout_meta(ConnPid, _ClaimRef, #state{conns_meta=ConnsMeta}) ->
+	maps:get(ConnPid, ConnsMeta, #{}).
+
 remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random},
 		conns=Conns, conns_meta=ConnsMeta}) ->
 	StateData#state{
@@ -757,7 +815,7 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
 	StateData#state{
 		conns=maps:remove(ConnPid, Conns),
 		conns_meta=maps:remove(ConnPid, ConnsMeta),
-		lookup=Lookup#{
+		lookup=prune_claims(ConnPid, Lookup#{
 			available => case WasUp of
 				true -> gb_trees:delete({OldCount, maps:get(ConnPid, Seqs)}, Available);
 				false -> Available
@@ -765,17 +823,89 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
 			stream_counts => maps:remove(ConnPid, StreamCounts),
 			seqs => maps:remove(ConnPid, Seqs),
 			up_count => case WasUp of true -> UpCount - 1; false -> UpCount end
-		}
+		})
 	}.
 
-claim_connection(_ConnPid, StateData=#state{lookup=#{strategy := random}}) ->
-	StateData;
-claim_connection(ConnPid, StateData=#state{lookup=#{strategy := least_loaded}, conns=Conns}) ->
+claim_connection(_ConnPid, _CallerPid, StateData=#state{lookup=#{strategy := random}}) ->
+	{undefined, StateData};
+claim_connection(ConnPid, CallerPid, StateData=#state{lookup=#{strategy := least_loaded}, conns=Conns}) ->
 	case maps:get(ConnPid, Conns) of
-		{up, ws, _} -> StateData;
-		{up, raw, _} -> StateData;
-		{up, _, _} -> adjust_stream_count(ConnPid, 1, StateData)
+		{up, ws, _} -> {undefined, StateData};
+		{up, raw, _} -> {undefined, StateData};
+		{up, _, _} -> mint_claim(ConnPid, CallerPid, adjust_stream_count(ConnPid, 1, StateData))
 	end.
+
+%% A minted claim token lets an explicit release/2 or an end-of-stream
+%% event consume exactly the claim it came from, so a stale or
+%% duplicate release can never erase a different, live claim on the
+%% same connection.
+mint_claim(ConnPid, CallerPid, StateData=#state{
+		lookup=Lookup=#{claims := Claims, claim_index := ClaimIndex}}) ->
+	ClaimRef = make_ref(),
+	Key = {ConnPid, CallerPid},
+	{ClaimRef, StateData#state{lookup=Lookup#{
+		claims => Claims#{ClaimRef => Key},
+		claim_index => ClaimIndex#{Key => [ClaimRef|maps:get(Key, ClaimIndex, [])]}
+	}}}.
+
+consume_claim(ClaimRef, StateData=#state{lookup=Lookup=#{claims := Claims}}) ->
+	case maps:take(ClaimRef, Claims) of
+		error ->
+			StateData;
+		{Key={ConnPid, _CallerPid}, Claims1} ->
+			adjust_stream_count(ConnPid, -1, StateData#state{lookup=Lookup#{
+				claims => Claims1,
+				claim_index => drop_claim_index(Key, ClaimRef, Lookup)
+			}})
+	end.
+
+%% Claims for the same {ConnPid, CallerPid} pair are interchangeable
+%% for accounting purposes, so an end-of-stream event only needs to
+%% consume any one token for that pair, not the specific one that
+%% funded the stream that just ended. This is what lets consumption
+%% piggyback on the existing release_stream message instead of
+%% threading the stream's own claim ref through the event handler.
+consume_claim_for(Key={ConnPid, _ReplyTo}, StateData=#state{
+		lookup=#{claim_index := ClaimIndex}}) ->
+	case maps:is_key(Key, ClaimIndex) of
+		true ->
+			consume_indexed_claim(Key, StateData);
+		false ->
+			%% The stream's reply_to can differ from the checkout
+			%% caller (reply_to is a request option). Consume any
+			%% claim on the connection instead: a claim must not
+			%% outlive the stream that converted it, or a later
+			%% stale release would erase a live claim.
+			case [K || K={CP, _} <- maps:keys(ClaimIndex), CP =:= ConnPid] of
+				[] -> StateData;
+				[FallbackKey|_] -> consume_indexed_claim(FallbackKey, StateData)
+			end
+	end.
+
+consume_indexed_claim(Key, StateData=#state{
+		lookup=Lookup=#{claims := Claims, claim_index := ClaimIndex}}) ->
+	[ClaimRef|Rest] = maps:get(Key, ClaimIndex),
+	StateData#state{lookup=Lookup#{
+		claims => maps:remove(ClaimRef, Claims),
+		claim_index => case Rest of
+			[] -> maps:remove(Key, ClaimIndex);
+			_ -> ClaimIndex#{Key => Rest}
+		end
+	}}.
+
+drop_claim_index(Key, ClaimRef, #{claim_index := ClaimIndex}) ->
+	case lists:delete(ClaimRef, maps:get(Key, ClaimIndex)) of
+		[] -> maps:remove(Key, ClaimIndex);
+		Refs -> ClaimIndex#{Key => Refs}
+	end.
+
+%% Bounds the claim maps without monitors: every claim dies with the
+%% connection it was minted for, whether or not it was ever consumed.
+prune_claims(ConnPid, Lookup=#{claims := Claims, claim_index := ClaimIndex}) ->
+	Lookup#{
+		claims => maps:filter(fun(_ClaimRef, {CP, _}) -> CP =/= ConnPid end, Claims),
+		claim_index => maps:filter(fun({CP, _}, _) -> CP =/= ConnPid end, ClaimIndex)
+	}.
 
 adjust_stream_count(ConnPid, Delta, StateData=#state{
 		lookup=#{available := Available0, stream_counts := StreamCounts,

@@ -43,8 +43,8 @@ dep_jsx = git https://github.com/talentdeficit/jsx v3.1.0
 dep_ci.erlang.mk = git https://github.com/ninenines/ci.erlang.mk master
 DEP_EARLY_PLUGINS = ci.erlang.mk
 
-AUTO_CI_OTP ?= OTP-LATEST-24+
-AUTO_CI_WINDOWS ?= OTP-LATEST-24+
+AUTO_CI_OTP ?= OTP-LATEST-28+
+AUTO_CI_WINDOWS ?= OTP-LATEST-28+
 
 # Hex configuration.
 define HEX_TARBALL_EXTRA_METADATA

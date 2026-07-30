@@ -25,7 +25,7 @@ jobs:
       - name: Set up Erlang/OTP
         uses: erlef/setup-beam@v1
         with:
-          otp-version: "27"
+          otp-version: "28"
           version-type: loose
           install-rebar: false
           install-hex: false
@@ -58,7 +58,7 @@ jobs:
       - name: Set up Erlang/OTP
         uses: erlef/setup-beam@v1
         with:
-          otp-version: "27"
+          otp-version: "28"
           version-type: loose
           install-rebar: false
           install-hex: false
