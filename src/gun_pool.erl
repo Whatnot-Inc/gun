@@ -99,6 +99,7 @@
 	| {gun_upgrade, pid(), gun:stream_ref(), [binary()], [{binary(), binary()}]}.
 
 -type opts() :: #{
+	claim_timeout => pos_integer(),
 	conn_opts => gun:opts(),
 	scope => any(),
 	setup_fun => {fun((pid(), setup_msg(), any()) -> any()), any()},
@@ -155,7 +156,10 @@
 	        | #{strategy := least_loaded, available := gb_trees:tree(),
 	            stream_counts := #{pid() => non_neg_integer()},
 	            seqs := #{pid() => non_neg_integer()}, next_seq := non_neg_integer(),
-	            up_count := non_neg_integer()}
+	            up_count := non_neg_integer(),
+	            pending := #{pid() => pos_integer()},
+	            claim_timeout := pos_integer(),
+	            manager_pid := pid()}
 }).
 
 %% Pool management.
@@ -502,7 +506,11 @@ ws_send(Frames, WsSendOpts=#{authority := Authority}) ->
 %% the gb_tree index and stream counts map accordingly. Claiming at checkout time
 %% avoids a race condition where the same connection would be handed
 %% out repeatedly before the event handler reported the newly opened
-%% stream.
+%% stream. A claim is confirmed when the event handler reports that a
+%% stream was started ({stream_started, ConnPid}); a claim that is not
+%% confirmed within claim_timeout expires and is released, so that a
+%% caller that checks out a connection but never sends a request (for
+%% example because it died) does not permanently reduce pool capacity.
 %%
 %% A connection is deemed suitable if it is possible to open new
 %% streams. How many streams can be open at any one time depends
@@ -536,7 +544,9 @@ init({Host, Port, Opts}) ->
 		least_loaded ->
 		#{strategy => least_loaded, available => gb_trees:empty(),
 			stream_counts => #{}, seqs => #{}, next_seq => 0,
-			up_count => 0, manager_pid => self()}
+			up_count => 0, pending => #{},
+			claim_timeout => maps:get(claim_timeout, Opts, 5000),
+			manager_pid => self()}
 	end,
 	ConnOpts = conn_opts(Lookup, Opts),
 	Conns = maps:from_list([begin
@@ -681,6 +691,29 @@ handle_common({call, From}, {checkout, _ReqOpts}, _,
 	end;
 handle_common(cast, {release_stream, ConnPid}, _, StateData) ->
 	{keep_state, adjust_stream_count(ConnPid, -1, StateData)};
+%% A stream was started on the connection: confirm one pending claim.
+%% When there is no pending claim (the claim already expired, or the
+%% stream was not started via checkout) the message is ignored.
+handle_common(cast, {stream_started, ConnPid}, _,
+		StateData=#state{lookup=#{strategy := least_loaded, pending := Pending}}) ->
+	case Pending of
+		#{ConnPid := _} ->
+			{keep_state, remove_pending_claim(ConnPid, StateData)};
+		_ ->
+			keep_state_and_data
+	end;
+%% A claim expired before a stream was started: release the claim.
+%% When there is no pending claim left (all claims were confirmed,
+%% or the connection went down) the message is ignored.
+handle_common(info, {timeout, _TRef, {claim_expired, ConnPid}}, _,
+		StateData=#state{lookup=#{strategy := least_loaded, pending := Pending}}) ->
+	case Pending of
+		#{ConnPid := _} ->
+			{keep_state, adjust_stream_count(ConnPid, -1,
+				remove_pending_claim(ConnPid, StateData))};
+		_ ->
+			keep_state_and_data
+	end;
 handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
@@ -691,7 +724,8 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 	{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 		StateData=#state{lookup=#{strategy := least_loaded, available := Available,
-				stream_counts := StreamCounts, seqs := Seqs, up_count := UpCount} = Lookup, conns=Conns}) ->
+				stream_counts := StreamCounts, seqs := Seqs, up_count := UpCount,
+				pending := Pending} = Lookup, conns=Conns}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
 	OldCount = maps:get(ConnPid, StreamCounts, 0),
 	OldSeq = maps:get(ConnPid, Seqs),
@@ -701,7 +735,8 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 			available => gb_trees:delete({OldCount, OldSeq}, Available),
 			stream_counts => maps:remove(ConnPid, StreamCounts),
 			seqs => maps:remove(ConnPid, Seqs),
-			up_count => UpCount - 1
+			up_count => UpCount - 1,
+			pending => maps:remove(ConnPid, Pending)
 		}
 	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
@@ -747,7 +782,7 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random},
 	};
 remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
 		available := Available, stream_counts := StreamCounts,
-		seqs := Seqs, up_count := UpCount} = Lookup,
+		seqs := Seqs, up_count := UpCount, pending := Pending} = Lookup,
 		conns=Conns, conns_meta=ConnsMeta}) ->
 	WasUp = case maps:get(ConnPid, Conns) of
 		{up, _, _} -> true;
@@ -764,7 +799,8 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
 			end,
 			stream_counts => maps:remove(ConnPid, StreamCounts),
 			seqs => maps:remove(ConnPid, Seqs),
-			up_count => case WasUp of true -> UpCount - 1; false -> UpCount end
+			up_count => case WasUp of true -> UpCount - 1; false -> UpCount end,
+			pending => maps:remove(ConnPid, Pending)
 		}
 	}.
 
@@ -774,7 +810,30 @@ claim_connection(ConnPid, StateData=#state{lookup=#{strategy := least_loaded}, c
 	case maps:get(ConnPid, Conns) of
 		{up, ws, _} -> StateData;
 		{up, raw, _} -> StateData;
-		{up, _, _} -> adjust_stream_count(ConnPid, 1, StateData)
+		{up, _, _} -> add_pending_claim(ConnPid,
+			adjust_stream_count(ConnPid, 1, StateData))
+	end.
+
+%% A claim is pending until the event handler reports that a stream
+%% was started on the connection ({stream_started, ConnPid}). If no
+%% stream follows within claim_timeout (for example because the caller
+%% died between checkout and request, or Gun rejected the request
+%% without creating a stream) the claim expires and the stream count
+%% is released, so that leaked claims cannot permanently reduce the
+%% pool capacity.
+add_pending_claim(ConnPid, StateData=#state{lookup=Lookup=#{
+		pending := Pending, claim_timeout := ClaimTimeout}}) ->
+	_ = erlang:start_timer(ClaimTimeout, self(), {claim_expired, ConnPid}),
+	StateData#state{lookup=Lookup#{
+		pending => maps:update_with(ConnPid, fun(N) -> N + 1 end, 1, Pending)
+	}}.
+
+remove_pending_claim(ConnPid, StateData=#state{lookup=Lookup=#{pending := Pending}}) ->
+	case Pending of
+		#{ConnPid := 1} ->
+			StateData#state{lookup=Lookup#{pending => maps:remove(ConnPid, Pending)}};
+		#{ConnPid := N} ->
+			StateData#state{lookup=Lookup#{pending => Pending#{ConnPid => N - 1}}}
 	end.
 
 adjust_stream_count(ConnPid, Delta, StateData=#state{
@@ -782,7 +841,11 @@ adjust_stream_count(ConnPid, Delta, StateData=#state{
 			seqs := Seqs, next_seq := Seq} = Lookup}) ->
 	case maps:find(ConnPid, StreamCounts) of
 		{ok, OldCount} ->
-			NewCount = OldCount + Delta,
+			%% The count is clamped at 0 to protect against a release
+			%% for a stream that was never counted (for example a
+			%% stream started on the connection without a checkout,
+			%% or a stream whose claim expired before it started).
+			NewCount = max(OldCount + Delta, 0),
 			OldSeq = maps:get(ConnPid, Seqs),
 			%% Assign a fresh sequence number so the just-used connection
 			%% sinks to the back of its stream-count bucket. This rotates

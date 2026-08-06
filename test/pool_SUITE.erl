@@ -42,7 +42,9 @@ groups() ->
 		degraded_configuration_error
 	],
 	[{random, [], Tests},
-	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin]}].
+	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin,
+		least_loaded_claim_released_without_request,
+		least_loaded_claim_not_released_during_request]}].
 
 init_per_suite(Config) ->
 	{ok, _} = cowboy:start_clear({?MODULE, tcp}, [], do_proto_opts()),
@@ -542,6 +544,71 @@ least_loaded_round_robin(Config) ->
 	end || _ <- lists:seq(1, Size)],
 	%% Every connection must have been used exactly once.
 	Size = length(lists:usort(ConnPids)).
+
+least_loaded_claim_released_without_request(Config) ->
+	doc("Confirm that a connection claimed at checkout is released when "
+		"no request follows, for example when the caller dies between "
+		"checkout and request."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1,
+		claim_timeout => 100
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% Checkout the only connection and never issue a request, as
+	%% happens when a caller dies between checkout and gun:request.
+	Self = self(),
+	CheckoutPid = spawn(fun() ->
+		{ConnPid, _Meta} = gun_pool:checkout(ManagerPid, #{}),
+		Self ! {self(), checked_out, ConnPid}
+	end),
+	receive {CheckoutPid, checked_out, _} -> ok
+	after 5000 -> error(checkout_timeout) end,
+	%% The claim must expire and the connection become available again.
+	ok = wait_all_streams_released(ManagerPid),
+	%% With size 1 and HTTP/1.1 (1 stream max) a leaked claim would
+	%% make this request fail with no_connection_available.
+	{async, PoolStreamRef} = gun_pool:get("/", #{<<"host">> => Authority},
+		#{scope => scope(?FUNCTION_NAME, Config)}),
+	{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef).
+
+least_loaded_claim_not_released_during_request(Config) ->
+	doc("Confirm that a claim confirmed by a request is not released "
+		"again when the claim timeout fires while the request is "
+		"still in flight."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => scope(?FUNCTION_NAME, Config),
+		lookup_strategy => least_loaded,
+		size => 1,
+		claim_timeout => 100
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% The delayed response takes 3000ms, much longer than the
+	%% claim timeout of 100ms.
+	{async, PoolStreamRef} = gun_pool:get("/delay", #{<<"host">> => Authority},
+		#{scope => scope(?FUNCTION_NAME, Config)}),
+	%% Wait until the claim timeout has fired, then confirm the
+	%% stream is still counted.
+	timer:sleep(500),
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	[1] = maps:values(StreamCounts),
+	{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
+	%% The count must return to exactly 0 (not below) once the
+	%% stream completes.
+	ok = wait_all_streams_released(ManagerPid),
+	{async, PoolStreamRef2} = gun_pool:get("/", #{<<"host">> => Authority},
+		#{scope => scope(?FUNCTION_NAME, Config)}),
+	{response, nofin, 200, _} = gun_pool:await(PoolStreamRef2),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef2).
 
 %% Poll the manager until every connection's stream count is back to 0.
 wait_all_streams_released(ManagerPid) ->

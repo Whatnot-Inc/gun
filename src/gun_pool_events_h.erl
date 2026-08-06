@@ -69,7 +69,10 @@ request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := random, tabl
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME);
-request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := least_loaded}) ->
+request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := least_loaded, manager := Manager}) ->
+	%% Confirm the claim made by the manager at checkout time. Claims
+	%% that are never confirmed expire and are released by the manager.
+	gen_statem:cast(Manager, {stream_started, self()}),
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME).
