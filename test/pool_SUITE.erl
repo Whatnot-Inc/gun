@@ -603,22 +603,23 @@ metrics_undefined(Config) ->
 	undefined = gun_pool:metrics(Authority, Scope).
 
 %% Poll until metrics match the expected map.
-%% Calls info/1 each iteration to flush pending manager messages (e.g. settings_changed).
-wait_for_metrics(ManagerPid, Expected) ->
-	wait_for_metrics(ManagerPid, Expected, 50).
+%% Calls info/2 each iteration to flush pending manager messages (e.g. settings_changed).
+wait_for_metrics(Authority, Scope, Expected) ->
+	wait_for_metrics(Authority, Scope, Expected, 50).
 
-wait_for_metrics(_ManagerPid, _Expected, 0) ->
+wait_for_metrics(_Authority, _Scope, _Expected, 0) ->
 	{error, timeout};
-wait_for_metrics(ManagerPid, Expected, N) ->
-	gun_pool:info(ManagerPid),
-	Actual = gun_pool:metrics(ManagerPid),
-	Match = maps:fold(fun(K, V, Acc) -> Acc andalso maps:get(K, Actual, undefined) =:= V end,
+wait_for_metrics(Authority, Scope, Expected, N) ->
+	gun_pool:info(Authority, Scope),
+	Actual = gun_pool:metrics(Authority, Scope),
+	Match = is_map(Actual) andalso maps:fold(
+		fun(K, V, Acc) -> Acc andalso maps:get(K, Actual, undefined) =:= V end,
 		true, Expected),
 	case Match of
 		true -> ok;
 		false ->
 			timer:sleep(20),
-			wait_for_metrics(ManagerPid, Expected, N - 1)
+			wait_for_metrics(Authority, Scope, Expected, N - 1)
 	end.
 
 %% Poll the manager until every connection's stream count is back to 0.
