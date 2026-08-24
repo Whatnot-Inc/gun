@@ -62,7 +62,8 @@ end_per_suite(_) ->
 		max_streams_h2_size_1_retry_least_loaded,
 		max_streams_h2_size_2_least_loaded,
 		max_streams_h2_size_2_retry_least_loaded,
-		reconnect_h1_least_loaded
+		reconnect_h1_least_loaded,
+		least_loaded_routing_least_loaded
 	],
 	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners],
 	ok.
@@ -491,7 +492,14 @@ do_degraded_configuration_error(Config) ->
 least_loaded_routing(Config) ->
 	doc("Confirm the least_loaded strategy always routes to the connection "
 		"with the fewest active streams."),
-	Port = config(port, Config),
+	%% Use a dedicated listener with a 30s delay so the busy connection
+	%% cannot free up before the test completes on slow CI runners.
+	Listener = listener_name(?FUNCTION_NAME, Config),
+	Routes = [{"/", hello_h, []}, {"/delay", delayed_hello_h, 30000}],
+	{ok, _} = cowboy:start_clear(Listener, [], #{
+		env => #{dispatch => cowboy_router:compile([{'_', Routes}])}
+	}),
+	Port = ranch:get_port(Listener),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
@@ -504,15 +512,19 @@ least_loaded_routing(Config) ->
 	{async, {BusyConn, _}} = gun_pool:get("/delay",
 		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
 	%% Send requests one at a time and await each before the next.
-	%% This keeps the idle connection at 0-1 streams, always below the
-	%% busy connection, so least_loaded must consistently pick it.
+	%% The stream is released asynchronously (the event handler casts
+	%% {release_stream, _} to the manager), so wait until the idle
+	%% connection is back to 0 streams before the next request. It is
+	%% then strictly below the busy connection, so least_loaded must
+	%% consistently pick it.
 	%% With random selection this would pass with probability ~0.1%.
 	_ = [begin
 		{async, {ConnPid, _} = PoolStreamRef} = gun_pool:get("/",
 			#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
 		true = ConnPid =/= BusyConn,
 		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
-		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef)
+		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
+		ok = wait_streams_released_except(ManagerPid, BusyConn)
 	end || _ <- lists:seq(1, 10)].
 
 least_loaded_round_robin(Config) ->
@@ -620,6 +632,25 @@ wait_for_metrics(Authority, Scope, Expected, N) ->
 		false ->
 			timer:sleep(20),
 			wait_for_metrics(Authority, Scope, Expected, N - 1)
+	end.
+
+%% Poll the manager until every connection except Excluded has 0 streams.
+wait_streams_released_except(ManagerPid, Excluded) ->
+	wait_streams_released_except(ManagerPid, Excluded, 100).
+
+wait_streams_released_except(_ManagerPid, _Excluded, 0) ->
+	{error, timeout};
+wait_streams_released_except(ManagerPid, Excluded, N) ->
+	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
+	Released = lists:all(fun({ConnPid, Count}) ->
+		ConnPid =:= Excluded orelse Count =:= 0
+	end, maps:to_list(StreamCounts)),
+	case Released of
+		true ->
+			ok;
+		false ->
+			timer:sleep(10),
+			wait_streams_released_except(ManagerPid, Excluded, N - 1)
 	end.
 
 %% Poll the manager until every connection's stream count is back to 0.
