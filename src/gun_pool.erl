@@ -153,11 +153,12 @@
 	conns :: #{pid() => down | {setup, any()} | {up, http | http2 | ws | raw, map()}},
 	conns_meta = #{} :: meta(),
 	await_up = [] :: [{pid(), any()}],
-	lookup :: #{strategy := random, table := ets:tid()}
+	lookup :: #{strategy := random, table := ets:tid(),
+	            active := atomics:atomics_ref(), pool_key := {any(), binary()}}
 	        | #{strategy := least_loaded, available := gb_trees:tree(),
 	            stream_counts := #{pid() => non_neg_integer()},
 	            seqs := #{pid() => non_neg_integer()}, next_seq := non_neg_integer(),
-	            up_count := non_neg_integer()}
+	            up_count := non_neg_integer(), manager_pid := pid()}
 }).
 
 %% Pool management.
