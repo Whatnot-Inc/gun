@@ -23,6 +23,8 @@
 -export([info/0]).
 -export([info/1]).
 -export([info/2]).
+-export([metrics/0]).
+-export([metrics/2]).
 -export([await_up/1]).
 -export([await_up/2]).
 -export([checkout/2]). %% Use responsibly!
@@ -209,6 +211,49 @@ info(Authority, Scope) ->
 		[{_, ManagerPid}] ->
 			gen_statem:call(ManagerPid, info)
 	end.
+
+%% Read pool metrics from ETS without calling the manager (random pools only).
+%% Counters may reflect a torn snapshot across connections but no call is made.
+-spec metrics() -> [map()].
+metrics() ->
+	[metrics_from_row(PoolKey, Row)
+	 || {PoolKey, Row} <- ets:tab2list(gun_pool_counters)].
+
+-spec metrics(binary(), any()) -> undefined | map().
+metrics(Authority, Scope) ->
+	metrics_by_key({Scope, Authority}).
+
+metrics_by_key(PoolKey) ->
+	case ets:lookup(gun_pool_counters, PoolKey) of
+		[] ->
+			undefined;
+		[{_, Row}] ->
+			metrics_from_row(PoolKey, Row)
+	end.
+
+metrics_from_row({Scope, _}, #{table := Tid, max_streams := Max, active := Active}) ->
+	ActiveN = atomics:get(Active, 1),
+	StreamRows = ets:tab2list(Tid),
+	Streams = lists:sum([C || {_, C} <- StreamRows]),
+	{Full, High} = occupancy(StreamRows, Max),
+	#{
+		scope => Scope,
+		active => ActiveN,
+		max_streams => Max,
+		streams => Streams,
+		full => Full,
+		high => High
+	}.
+
+occupancy(_Rows, infinity) ->
+	{0, 0};
+occupancy(Rows, Max) ->
+	HighThreshold = (Max * 9 + 9) div 10,
+	lists:foldl(fun({_, Count}, {F, H}) ->
+		F1 = if Count >= Max -> F + 1; true -> F end,
+		H1 = if Count >= HighThreshold -> H + 1; true -> H end,
+		{F1, H1}
+	end, {0, 0}, Rows).
 
 -spec await_up(pid() | binary()) -> ok | {error, pool_not_found, atom()}.
 await_up(ManagerPid) when is_pid(ManagerPid) ->
@@ -526,13 +571,20 @@ start_link(Host, Port, Opts) ->
 
 init({Host, Port, Opts}) ->
 	process_flag(trap_exit, true),
-	true = ets:insert_new(gun_pools, {gun_pools_key(Host, Port, Opts), self()}),
+	PoolKey = gun_pools_key(Host, Port, Opts),
+	true = ets:insert_new(gun_pools, {PoolKey, self()}),
 	Size = maps:get(size, Opts, 8),
 	%% @todo Only start processes in static mode.
 	Lookup = case maps:get(lookup_strategy, Opts, random) of
 		random ->
 			Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
-			#{strategy => random, table => Tid};
+			Active = atomics:new(1, [{signed, false}]),
+			ets:insert(gun_pool_counters, {PoolKey, #{
+				table => Tid,
+				max_streams => infinity,
+				active => Active
+			}}),
+			#{strategy => random, table => Tid, active => Active, pool_key => PoolKey};
 		least_loaded ->
 		#{strategy => least_loaded, available => gb_trees:empty(),
 			stream_counts => #{}, seqs => #{}, next_seq => 0,
@@ -630,6 +682,7 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 		%% Websocket or tunnel stream refs.
 		{up, Protocol, Meta} ->
 			Settings = #{},
+			metrics_conn_up(Lookup, Protocol),
 			StateData = StateData0#state{
 				conns=Conns#{ConnPid => {up, Protocol, Settings}},
 				conns_meta=ConnsMeta#{ConnPid => Meta},
@@ -681,13 +734,15 @@ handle_common({call, From}, {checkout, _ReqOpts}, _,
 	end;
 handle_common(cast, {release_stream, ConnPid}, _, StateData) ->
 	{keep_state, adjust_stream_count(ConnPid, -1, StateData)};
-handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns}) ->
+handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns, lookup=Lookup}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
+	metrics_update_max_streams(Lookup, Settings),
 	{keep_state, StateData#state{conns=Conns#{ConnPid => {up, http2, Settings}}}};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
-		StateData=#state{lookup=#{strategy := random}, conns=Conns}) ->
+		StateData=#state{lookup=#{strategy := random, active := Active}, conns=Conns}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
+	atomics:sub(Active, 1, 1),
 	{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 		StateData=#state{lookup=#{strategy := least_loaded, available := Available,
@@ -706,6 +761,15 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
 handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _, StateData0) ->
+	%% gun_down fires before DOWN in normal cases and already decrements active.
+	%% Guard against sudden process death (no gun_down) where the conn is still up.
+	_ = case {maps:get(ConnPid0, StateData0#state.conns, undefined),
+			StateData0#state.lookup} of
+		{{up, _, _}, #{strategy := random, active := Active}} ->
+			atomics:sub(Active, 1, 1);
+		_ ->
+			ok
+	end,
 	StateData=#state{host=Host, port=Port, opts=Opts, lookup=Lookup, conns=Conns}
 		= remove_down_conn(ConnPid0, StateData0),
 	case Reason of
@@ -873,5 +937,29 @@ terminate(Reason, StateName, #state{host=Host, port=Port, opts=Opts, await_up=Aw
 	gen_statem:reply([
 		{reply, ReplyTo, {error, {terminate, StateName, Reason}}}
 	|| ReplyTo <- AwaitUp]),
-	true = ets:delete(gun_pools, gun_pools_key(Host, Port, Opts)),
+	PoolKey = gun_pools_key(Host, Port, Opts),
+	true = ets:delete(gun_pools, PoolKey),
+	ets:delete(gun_pool_counters, PoolKey),
 	ok.
+
+metrics_conn_up(#{strategy := random, active := Active, pool_key := PoolKey}, http) ->
+	atomics:add(Active, 1, 1),
+	update_pool_counter_max_streams(PoolKey, 1);
+metrics_conn_up(#{strategy := random, active := Active}, _Protocol) ->
+	atomics:add(Active, 1, 1);
+metrics_conn_up(_Lookup, _Protocol) ->
+	ok.
+
+metrics_update_max_streams(#{strategy := random, pool_key := PoolKey}, Settings) ->
+	MaxStreams = maps:get(max_concurrent_streams, Settings, infinity),
+	update_pool_counter_max_streams(PoolKey, MaxStreams);
+metrics_update_max_streams(_Lookup, _Settings) ->
+	ok.
+
+update_pool_counter_max_streams(PoolKey, MaxStreams) ->
+	case ets:lookup(gun_pool_counters, PoolKey) of
+		[{_, Row}] ->
+			ets:insert(gun_pool_counters, {PoolKey, Row#{max_streams => MaxStreams}});
+		[] ->
+			ok
+	end.
