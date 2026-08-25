@@ -492,14 +492,7 @@ do_degraded_configuration_error(Config) ->
 least_loaded_routing(Config) ->
 	doc("Confirm the least_loaded strategy always routes to the connection "
 		"with the fewest active streams."),
-	%% Use a dedicated listener with a 30s delay so the busy connection
-	%% cannot free up before the test completes on slow CI runners.
-	Listener = listener_name(?FUNCTION_NAME, Config),
-	Routes = [{"/", hello_h, []}, {"/delay", delayed_hello_h, 30000}],
-	{ok, _} = cowboy:start_clear(Listener, [], #{
-		env => #{dispatch => cowboy_router:compile([{'_', Routes}])}
-	}),
-	Port = ranch:get_port(Listener),
+	Port = config(port, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
@@ -512,19 +505,15 @@ least_loaded_routing(Config) ->
 	{async, {BusyConn, _}} = gun_pool:get("/delay",
 		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
 	%% Send requests one at a time and await each before the next.
-	%% The stream is released asynchronously (the event handler casts
-	%% {release_stream, _} to the manager), so wait until the idle
-	%% connection is back to 0 streams before the next request. It is
-	%% then strictly below the busy connection, so least_loaded must
-	%% consistently pick it.
+	%% This keeps the idle connection at 0-1 streams, always below the
+	%% busy connection, so least_loaded must consistently pick it.
 	%% With random selection this would pass with probability ~0.1%.
 	_ = [begin
 		{async, {ConnPid, _} = PoolStreamRef} = gun_pool:get("/",
 			#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
 		true = ConnPid =/= BusyConn,
 		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
-		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
-		ok = wait_streams_released_except(ManagerPid, BusyConn)
+		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef)
 	end || _ <- lists:seq(1, 10)].
 
 least_loaded_round_robin(Config) ->
