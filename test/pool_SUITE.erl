@@ -623,25 +623,6 @@ wait_for_metrics(Authority, Scope, Expected, N) ->
 			wait_for_metrics(Authority, Scope, Expected, N - 1)
 	end.
 
-%% Poll the manager until every connection except Excluded has 0 streams.
-wait_streams_released_except(ManagerPid, Excluded) ->
-	wait_streams_released_except(ManagerPid, Excluded, 100).
-
-wait_streams_released_except(_ManagerPid, _Excluded, 0) ->
-	{error, timeout};
-wait_streams_released_except(ManagerPid, Excluded, N) ->
-	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
-	Released = lists:all(fun({ConnPid, Count}) ->
-		ConnPid =:= Excluded orelse Count =:= 0
-	end, maps:to_list(StreamCounts)),
-	case Released of
-		true ->
-			ok;
-		false ->
-			timer:sleep(10),
-			wait_streams_released_except(ManagerPid, Excluded, N - 1)
-	end.
-
 %% Poll the manager until every connection's stream count is back to 0.
 wait_all_streams_released(ManagerPid) ->
 	wait_all_streams_released(ManagerPid, 100).
