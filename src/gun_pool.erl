@@ -217,8 +217,8 @@ info(Authority, Scope) ->
 %% Counters may reflect a torn snapshot across connections but no call is made.
 -spec metrics() -> [map()].
 metrics() ->
-	[metrics_from_row(PoolKey, Row)
-	 || {PoolKey, Row} <- ets:tab2list(gun_pool_counters)].
+	[M || {PoolKey, Row} <- ets:tab2list(gun_pool_counters),
+		M <- [metrics_from_row(PoolKey, Row)], M =/= undefined].
 
 -spec metrics(binary(), any()) -> undefined | map().
 metrics(Authority, Scope) ->
@@ -233,19 +233,24 @@ metrics_by_key(PoolKey) ->
 	end.
 
 metrics_from_row({Scope, _}, #{table := Tid, max_streams := Max, active := Active, size := Size}) ->
-	ActiveN = atomics:get(Active, 1),
-	StreamRows = ets:tab2list(Tid),
-	Streams = lists:sum([C || {_, C} <- StreamRows]),
-	{Full, High} = occupancy(StreamRows, Max),
-	#{
-		scope => Scope,
-		size => Size,
-		active => ActiveN,
-		max_streams => Max,
-		streams => Streams,
-		full => Full,
-		high => High
-	}.
+	%% The per-pool table is owned by the manager and deleted on terminate.
+	try
+		ActiveN = atomics:get(Active, 1),
+		StreamRows = ets:tab2list(Tid),
+		Streams = lists:sum([C || {_, C} <- StreamRows]),
+		{Full, High} = occupancy(StreamRows, Max),
+		#{
+			scope => Scope,
+			size => Size,
+			active => ActiveN,
+			max_streams => Max,
+			streams => Streams,
+			full => Full,
+			high => High
+		}
+	catch _:_ ->
+		undefined
+	end.
 
 occupancy(_Rows, infinity) ->
 	{0, 0};
