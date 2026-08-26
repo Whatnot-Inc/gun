@@ -232,13 +232,14 @@ metrics_by_key(PoolKey) ->
 			metrics_from_row(PoolKey, Row)
 	end.
 
-metrics_from_row({Scope, _}, #{table := Tid, max_streams := Max, active := Active}) ->
+metrics_from_row({Scope, _}, #{table := Tid, max_streams := Max, active := Active, size := Size}) ->
 	ActiveN = atomics:get(Active, 1),
 	StreamRows = ets:tab2list(Tid),
 	Streams = lists:sum([C || {_, C} <- StreamRows]),
 	{Full, High} = occupancy(StreamRows, Max),
 	#{
 		scope => Scope,
+		size => Size,
 		active => ActiveN,
 		max_streams => Max,
 		streams => Streams,
@@ -582,6 +583,7 @@ init({Host, Port, Opts}) ->
 			Active = atomics:new(1, [{signed, false}]),
 			ets:insert(gun_pool_counters, {PoolKey, #{
 				table => Tid,
+				size => Size,
 				max_streams => infinity,
 				active => Active
 			}}),

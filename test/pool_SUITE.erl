@@ -565,7 +565,7 @@ metrics_idle(Config) ->
 	{ok, _} = gun_pool:await_body(PoolStreamRef),
 	%% Flush pending manager messages (e.g. settings_changed) with a synchronous call.
 	gun_pool:info(Authority, Scope),
-	#{active := Size, streams := 0, full := 0, high := 0} = gun_pool:metrics(Authority, Scope).
+	#{size := Size, active := Size, streams := 0, full := 0, high := 0} = gun_pool:metrics(Authority, Scope).
 
 metrics_streams(Config) ->
 	doc("Confirm pool metrics count in-flight streams and detect full/high connections."),
@@ -586,7 +586,7 @@ metrics_streams(Config) ->
 	[gun_pool:get("/delay", #{<<"host">> => Authority},
 		#{scope => Scope}) || _ <- lists:seq(1, 5)],
 	%% Poll until event handler has counted all 5 streams and manager has processed SETTINGS.
-	ok = wait_for_metrics(Authority, Scope, #{active => 1, streams => 5, full => 1,
+	ok = wait_for_metrics(Authority, Scope, #{size => 1, active => 1, streams => 5, full => 1,
 		high => 1, max_streams => 5}).
 
 metrics_undefined(Config) ->
