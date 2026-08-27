@@ -565,7 +565,10 @@ metrics_idle(Config) ->
 	{ok, _} = gun_pool:await_body(PoolStreamRef),
 	%% Flush pending manager messages (e.g. settings_changed) with a synchronous call.
 	gun_pool:info(Authority, Scope),
-	#{size := Size, active := Size, streams := 0, full := 0, high := 0} = gun_pool:metrics(Authority, Scope).
+	#{size := Size, active := Size, streams := 0, full := 0, high := 0,
+		authority := Authority, scope := Scope} = gun_pool:metrics(Authority, Scope),
+	[#{size := Size, active := Size, streams := 0, full := 0, high := 0,
+		authority := Authority, scope := Scope}] = gun_pool:metrics(Scope).
 
 metrics_streams(Config) ->
 	doc("Confirm pool metrics count in-flight streams and detect full/high connections."),

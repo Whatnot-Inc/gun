@@ -24,6 +24,7 @@
 -export([info/1]).
 -export([info/2]).
 -export([metrics/0]).
+-export([metrics/1]).
 -export([metrics/2]).
 -export([await_up/1]).
 -export([await_up/2]).
@@ -217,8 +218,11 @@ info(Authority, Scope) ->
 %% Counters may reflect a torn snapshot across connections but no call is made.
 -spec metrics() -> [map()].
 metrics() ->
-	[M || {PoolKey, Row} <- ets:tab2list(gun_pool_counters),
-		M <- [metrics_from_row(PoolKey, Row)], M =/= undefined].
+	metrics_from_rows(ets:tab2list(gun_pool_counters)).
+
+-spec metrics(any()) -> [map()].
+metrics(Scope) ->
+	metrics_from_rows(ets:match_object(gun_pool_counters, {{Scope, '_'}, '_'})).
 
 -spec metrics(binary(), any()) -> undefined | map().
 metrics(Authority, Scope) ->
@@ -232,7 +236,11 @@ metrics_by_key(PoolKey) ->
 			metrics_from_row(PoolKey, Row)
 	end.
 
-metrics_from_row({Scope, _}, #{table := Tid, max_streams := Max, active := Active, size := Size}) ->
+metrics_from_rows(Rows) ->
+	[M || {PoolKey, Row} <- Rows,
+		M <- [metrics_from_row(PoolKey, Row)], M =/= undefined].
+
+metrics_from_row({Scope, Authority}, #{table := Tid, max_streams := Max, active := Active, size := Size}) ->
 	%% The per-pool table is owned by the manager and deleted on terminate.
 	try
 		ActiveN = atomics:get(Active, 1),
@@ -241,6 +249,7 @@ metrics_from_row({Scope, _}, #{table := Tid, max_streams := Max, active := Activ
 		{Full, High} = occupancy(StreamRows, Max),
 		#{
 			scope => Scope,
+			authority => Authority,
 			size => Size,
 			active => ActiveN,
 			max_streams => Max,
