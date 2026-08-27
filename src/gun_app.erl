@@ -24,6 +24,9 @@
 
 start(_Type, _Args) ->
 	gun_pools = ets:new(gun_pools, [ordered_set, public, named_table]),
+	gun_pool_counters = ets:new(gun_pool_counters, [
+		set, public, named_table, {read_concurrency, true}
+	]),
 	gun_sup:start_link().
 
 stop(_State) ->

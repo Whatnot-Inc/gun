@@ -2,7 +2,7 @@
 
 PROJECT = whatnot_gun
 PROJECT_DESCRIPTION = HTTP/1.1, HTTP/2 and Websocket client for Erlang/OTP.
-PROJECT_VERSION = 2.4.3
+PROJECT_VERSION = 2.4.4
 
 # The OTP application is renamed to whatnot_gun for the Whatnot fork, but the
 # modules, application callback, and supervisor keep their upstream `gun_*`

@@ -41,8 +41,8 @@ groups() ->
 		stop_pool,
 		degraded_configuration_error
 	],
-	[{random, [], Tests},
-	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin]}].
+	[{random, [], Tests ++ [metrics_idle, metrics_streams]},
+	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin, metrics_undefined]}].
 
 init_per_suite(Config) ->
 	{ok, _} = cowboy:start_clear({?MODULE, tcp}, [], do_proto_opts()),
@@ -57,11 +57,13 @@ end_per_suite(_) ->
 		max_streams_h2_size_2_random,
 		max_streams_h2_size_2_retry_random,
 		reconnect_h1_random,
+		metrics_streams_random,
 		max_streams_h2_size_1_least_loaded,
 		max_streams_h2_size_1_retry_least_loaded,
 		max_streams_h2_size_2_least_loaded,
 		max_streams_h2_size_2_retry_least_loaded,
-		reconnect_h1_least_loaded
+		reconnect_h1_least_loaded,
+		least_loaded_routing_least_loaded
 	],
 	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners],
 	ok.
@@ -542,6 +544,84 @@ least_loaded_round_robin(Config) ->
 	end || _ <- lists:seq(1, Size)],
 	%% Every connection must have been used exactly once.
 	Size = length(lists:usort(ConnPids)).
+
+metrics_idle(Config) ->
+	doc("Confirm pool metrics reflect active connections and zero streams when idle."),
+	Port = config(port, Config),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	Size = 3,
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope,
+		lookup_strategy => random,
+		size => Size
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% Make a request so SETTINGS have been negotiated.
+	{async, PoolStreamRef} = gun_pool:get("/",
+		#{<<"host">> => Authority}, #{scope => Scope}),
+	{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
+	{ok, _} = gun_pool:await_body(PoolStreamRef),
+	%% Flush pending manager messages (e.g. settings_changed) with a synchronous call.
+	gun_pool:info(Authority, Scope),
+	#{size := Size, active := Size, streams := 0, full := 0, high := 0} = gun_pool:metrics(Authority, Scope).
+
+metrics_streams(Config) ->
+	doc("Confirm pool metrics count in-flight streams and detect full/high connections."),
+	Listener = listener_name(?FUNCTION_NAME, Config),
+	ProtoOpts = do_proto_opts(),
+	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{max_concurrent_streams => 5}),
+	Port = ranch:get_port(Listener),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope,
+		lookup_strategy => random,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% Fill the single connection to max capacity.
+	[gun_pool:get("/delay", #{<<"host">> => Authority},
+		#{scope => Scope}) || _ <- lists:seq(1, 5)],
+	%% Poll until event handler has counted all 5 streams and manager has processed SETTINGS.
+	ok = wait_for_metrics(Authority, Scope, #{size => 1, active => 1, streams => 5, full => 1,
+		high => 1, max_streams => 5}).
+
+metrics_undefined(Config) ->
+	doc("Confirm metrics returns undefined for the least_loaded strategy."),
+	Port = config(port, Config),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope,
+		lookup_strategy => least_loaded,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	undefined = gun_pool:metrics(Authority, Scope).
+
+%% Poll until metrics match the expected map.
+%% Calls info/2 each iteration to flush pending manager messages (e.g. settings_changed).
+wait_for_metrics(Authority, Scope, Expected) ->
+	wait_for_metrics(Authority, Scope, Expected, 50).
+
+wait_for_metrics(_Authority, _Scope, _Expected, 0) ->
+	{error, timeout};
+wait_for_metrics(Authority, Scope, Expected, N) ->
+	gun_pool:info(Authority, Scope),
+	Actual = gun_pool:metrics(Authority, Scope),
+	Match = is_map(Actual) andalso maps:fold(
+		fun(K, V, Acc) -> Acc andalso maps:get(K, Actual, undefined) =:= V end,
+		true, Expected),
+	case Match of
+		true -> ok;
+		false ->
+			timer:sleep(20),
+			wait_for_metrics(Authority, Scope, Expected, N - 1)
+	end.
 
 %% Poll the manager until every connection's stream count is back to 0.
 wait_all_streams_released(ManagerPid) ->
