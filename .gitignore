@@ -9,3 +9,4 @@ ebin/test
 ebin/*.beam
 logs
 test/*.beam
+/.worktrees/
