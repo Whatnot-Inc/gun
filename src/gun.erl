@@ -1562,6 +1562,16 @@ closing(state_timeout, closing_timeout, State=#state{status=Status}) ->
 		_ -> normal
 	end,
 	disconnect(State, Reason);
+%% A locally shut down connection cannot reconnect. Requests queued behind
+%% shutdown have not been sent and must be rejected, regardless of retry opts.
+closing(cast, {headers, ReplyTo, StreamRef, _Method, _Path, _Headers, _InitialFlow},
+		State=#state{status=shutdown}) ->
+	reply(ReplyTo, {gun_error, self(), StreamRef, {closing, shutdown}}),
+	{keep_state, State};
+closing(cast, {request, ReplyTo, StreamRef, _Method, _Path, _Headers, _Body, _InitialFlow},
+		State=#state{status=shutdown}) ->
+	reply(ReplyTo, {gun_error, self(), StreamRef, {closing, shutdown}}),
+	{keep_state, State};
 %% When reconnect is disabled, fail HTTP/Websocket operations immediately.
 closing(cast, {headers, ReplyTo, StreamRef, _Method, _Path, _Headers, _InitialFlow},
 		State=#state{opts=#{retry := 0}}) ->

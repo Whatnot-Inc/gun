@@ -41,7 +41,8 @@ groups() ->
 		stop_pool,
 		degraded_configuration_error
 	],
-	[{random, [], Tests ++ [metrics_idle, metrics_streams]},
+	[{random, [], Tests ++ [metrics_idle, metrics_streams,
+		retire_h2_random, retire_h2_random_connection_dies, retire_h2_random_invalid]},
 	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin, metrics_undefined]}].
 
 init_per_suite(Config) ->
@@ -65,7 +66,8 @@ end_per_suite(_) ->
 		reconnect_h1_least_loaded,
 		least_loaded_routing_least_loaded
 	],
-	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners],
+	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners,
+		maps:is_key(Listener, ranch:info())],
 	ok.
 
 init_per_group(GroupName, Config) ->
@@ -605,6 +607,83 @@ metrics_undefined(Config) ->
 	}),
 	gun_pool:await_up(ManagerPid),
 	undefined = gun_pool:metrics(Authority, Scope).
+
+retire_h2_random(Config) ->
+	doc("Retiring a random HTTP/2 connection excludes it from checkout, "
+		"replaces it immediately, and drains its existing streams."),
+	Port = config(port, Config),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2], http2_opts => #{closing_timeout => 4000}},
+		scope => Scope, lookup_strategy => random, size => 1
+	}),
+	ok = gun_pool:await_up(ManagerPid),
+	{OldConn, _} = gun_pool:checkout(ManagerPid, #{}),
+	{async, {OldConn, SlowRef}} = gun_pool:get("/delay",
+		#{<<"host">> => Authority}, #{scope => Scope}),
+	ok = wait_for_metrics(Authority, Scope, #{active => 1, streams => 1}),
+	ok = gun_pool:retire(ManagerPid, OldConn),
+	ok = gun_pool:retire(ManagerPid, OldConn),
+	{_, #{conns := Conns}} = gun_pool:info(ManagerPid),
+	1 = map_size(Conns),
+	false = maps:is_key(OldConn, Conns),
+	ok = gun_pool:await_up(ManagerPid),
+	{NewConn, _} = gun_pool:checkout(ManagerPid, #{}),
+	true = NewConn =/= OldConn,
+	{async, {NewConn, FastRef}} = gun_pool:get("/",
+		#{<<"host">> => Authority}, #{scope => Scope}),
+	{response, nofin, 200, _} = gun_pool:await({NewConn, FastRef}),
+	{ok, <<"Hello world!">>} = gun_pool:await_body({NewConn, FastRef}),
+	#{state_name := closing} = gun:info(OldConn),
+	{error, {stream_error, {closing, shutdown}}} = gun:await(OldConn, gun:get(OldConn, "/"), 500),
+	{response, nofin, 200, _} = gun_pool:await({OldConn, SlowRef}, 4000),
+	{ok, <<"Hello world!">>} = gun_pool:await_body({OldConn, SlowRef}),
+	ok = wait_for_metrics(Authority, Scope, #{size => 1, active => 1, streams => 0}),
+	{operational, #{conns := ConnsAfter}} = gun_pool:info(ManagerPid),
+	1 = map_size(ConnsAfter),
+	true = maps:is_key(NewConn, ConnsAfter),
+	ok = gun_pool:stop_pool("localhost", Port, #{scope => Scope}).
+
+retire_h2_random_connection_dies(Config) ->
+	doc("A draining connection that dies is cleaned up without starting a second replacement."),
+	Port = config(port, Config),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2], http2_opts => #{closing_timeout => 4000}},
+		scope => Scope, lookup_strategy => random, size => 1
+	}),
+	ok = gun_pool:await_up(ManagerPid),
+	{OldConn, _} = gun_pool:checkout(ManagerPid, #{}),
+	{async, {OldConn, _}} = gun_pool:get("/delay",
+		#{<<"host">> => Authority}, #{scope => Scope}),
+	ok = wait_for_metrics(Authority, Scope, #{streams => 1}),
+	ok = gun_pool:retire(ManagerPid, OldConn),
+	ok = gun_pool:await_up(ManagerPid),
+	{NewConn, _} = gun_pool:checkout(ManagerPid, #{}),
+	Ref = monitor(process, OldConn),
+	exit(OldConn, kill),
+	receive {'DOWN', Ref, process, OldConn, killed} -> ok end,
+	ok = wait_for_metrics(Authority, Scope, #{size => 1, active => 1, streams => 0}),
+	{operational, #{conns := Conns}} = gun_pool:info(ManagerPid),
+	#{NewConn := {up, http2, _}} = Conns,
+	1 = map_size(Conns),
+	ok = gun_pool:stop_pool("localhost", Port, #{scope => Scope}).
+
+retire_h2_random_invalid(Config) ->
+	doc("Retiring a non-member or a connection that is not up does not change pool size."),
+	Port = config(port, Config),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope, lookup_strategy => random, size => 1
+	}),
+	{error, not_pool_member} = gun_pool:retire(ManagerPid, self()),
+	ok = gun_pool:await_up(ManagerPid),
+	{_, #{conns := Conns}} = gun_pool:info(ManagerPid),
+	1 = map_size(Conns),
+	ok = gun_pool:stop_pool("localhost", Port, #{scope => Scope}).
 
 %% Poll until metrics match the expected map.
 %% Calls info/2 each iteration to flush pending manager messages (e.g. settings_changed).

@@ -29,6 +29,7 @@
 -export([await_up/1]).
 -export([await_up/2]).
 -export([checkout/2]). %% Use responsibly!
+-export([retire/2]).
 
 %% Requests.
 -export([delete/2]).
@@ -152,6 +153,7 @@
 	port :: inet:port_number(),
 	opts :: opts(),
 	conns :: #{pid() => down | {setup, any()} | {up, http | http2 | ws | raw, map()}},
+	retiring = #{} :: #{pid() => true},
 	conns_meta = #{} :: meta(),
 	await_up = [] :: [{pid(), any()}],
 	lookup :: #{strategy := random, table := ets:tid(),
@@ -314,6 +316,12 @@ checkout_retry(ManagerPid, ReqOpts, CallTimeout, [Wait|Retry]) ->
 		Result ->
 			Result
 	end.
+
+%% Remove a random-pool connection from checkout before beginning graceful shutdown.
+%% The replacement is started now, rather than when the draining process exits.
+-spec retire(pid(), pid()) -> ok | {error, unsupported_strategy | not_pool_member | not_up}.
+retire(ManagerPid, ConnPid) ->
+	gen_statem:call(ManagerPid, {retire, ConnPid}).
 
 %% Requests.
 
@@ -749,13 +757,45 @@ handle_common({call, From}, {checkout, _ReqOpts}, _,
 			{keep_state, claim_connection(ConnPid, StateData),
 				{reply, From, {ConnPid, Meta}}}
 	end;
+handle_common({call, From}, {retire, ConnPid}, _,
+		StateData=#state{lookup=#{strategy := random, active := Active}=Lookup,
+			conns=Conns, conns_meta=ConnsMeta, retiring=Retiring,
+			host=Host, port=Port, opts=Opts}) ->
+	case {maps:find(ConnPid, Conns), maps:is_key(ConnPid, Retiring)} of
+		{_, true} ->
+			{keep_state_and_data, {reply, From, ok}};
+		{{ok, {up, _, _}}, false} ->
+			%% No later checkout can see ConnPid once this call has replied.
+			atomics:sub(Active, 1, 1),
+			{ok, NewConnPid} = gun:open(Host, Port, conn_opts(Lookup, Opts)),
+			_ = monitor(process, NewConnPid),
+			State = StateData#state{
+				conns=maps:put(NewConnPid, down, maps:remove(ConnPid, Conns)),
+				conns_meta=maps:remove(ConnPid, ConnsMeta),
+				retiring=Retiring#{ConnPid => true}
+			},
+			gun:shutdown(ConnPid),
+			{next_state, degraded, State, {reply, From, ok}};
+		{{ok, _}, false} ->
+			{keep_state_and_data, {reply, From, {error, not_up}}};
+		{error, false} ->
+			{keep_state_and_data, {reply, From, {error, not_pool_member}}}
+	end;
+handle_common({call, From}, {retire, _ConnPid}, _, _) ->
+	{keep_state_and_data, {reply, From, {error, unsupported_strategy}}};
 handle_common(cast, {release_stream, ConnPid}, _, StateData) ->
 	{keep_state, adjust_stream_count(ConnPid, -1, StateData)};
+handle_common(info, {gun_notify, ConnPid, settings_changed, _}, _,
+		StateData=#state{retiring=Retiring}) when is_map_key(ConnPid, Retiring) ->
+	{keep_state, StateData};
 handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns, lookup=Lookup}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
 	metrics_update_max_streams(Lookup, Settings),
 	{keep_state, StateData#state{conns=Conns#{ConnPid => {up, http2, Settings}}}};
+handle_common(info, {gun_down, ConnPid, _, _, _}, _,
+		StateData=#state{retiring=Retiring}) when is_map_key(ConnPid, Retiring) ->
+	{keep_state, StateData};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 		StateData=#state{lookup=#{strategy := random, active := Active}, conns=Conns}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
@@ -777,6 +817,11 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 		}
 	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
+handle_common(info, {'DOWN', _MRef, process, ConnPid, _Reason}, _,
+		StateData=#state{retiring=Retiring, lookup=#{strategy := random, table := Tid}})
+		when is_map_key(ConnPid, Retiring) ->
+	ets:delete(Tid, ConnPid),
+	{keep_state, StateData#state{retiring=maps:remove(ConnPid, Retiring)}};
 handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _, StateData0) ->
 	%% gun_down fires before DOWN in normal cases and already decrements active.
 	%% Guard against sudden process death (no gun_down) where the conn is still up.
