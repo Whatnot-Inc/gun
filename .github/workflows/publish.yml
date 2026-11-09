@@ -12,7 +12,11 @@ on:
 
 jobs:
   publish:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -20,7 +24,7 @@ jobs:
       JFROG_REPO: whatnot_hex
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
           fetch-depth: 0
@@ -45,10 +49,12 @@ jobs:
 
       - name: Check if already tagged
         id: tag-check
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          if git tag --list "v${{ steps.meta.outputs.version }}" | grep -q .; then
+          if git tag --list "v${VERSION}" | grep -q .; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "v${{ steps.meta.outputs.version }} already tagged — skipping publish"
+            echo "v${VERSION} already tagged — skipping publish"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -56,11 +62,14 @@ jobs:
       - name: Build hex tarball
         if: steps.tag-check.outputs.skip != 'true'
         id: build
+        env:
+          APP: ${{ steps.meta.outputs.app }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           make
           make hex-tarball-create
-          ARTIFACT="${{ steps.meta.outputs.app }}-${{ steps.meta.outputs.version }}.tar"
-          cp ".erlang.mk/${{ steps.meta.outputs.app }}.tar" "${ARTIFACT}"
+          ARTIFACT="${APP}-${VERSION}.tar"
+          cp ".erlang.mk/${APP}.tar" "${ARTIFACT}"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
 
       - name: Setup JFrog CLI
@@ -76,8 +85,9 @@ jobs:
       - name: Check if artifact already exists in JFrog
         if: steps.tag-check.outputs.skip != 'true'
         id: jfrog-check
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
         run: |
-          ARTIFACT="${{ steps.build.outputs.artifact }}"
           SEARCH_RESULT=$(jf rt search "${JFROG_REPO}/tarballs/${ARTIFACT}")
           if [ "$SEARCH_RESULT" != "[]" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -88,32 +98,42 @@ jobs:
 
       - name: Upload to JFrog
         if: steps.tag-check.outputs.skip != 'true' && steps.jfrog-check.outputs.exists != 'true'
-        run: jf rt upload "${{ steps.build.outputs.artifact }}" "${JFROG_REPO}/tarballs/" --flat=true
+        env:
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+        run: jf rt upload "${ARTIFACT}" "${JFROG_REPO}/tarballs/" --flat=true
 
       - name: Create and push git tag
         id: tag-push
         if: steps.tag-check.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}
         run: |
           git config user.name whatnot-ci-bot
           git config user.email whatnot-ci-bot@whatnot.com
-          git tag "v${{ steps.meta.outputs.version }}" "${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_sha }}"
-          git push origin "v${{ steps.meta.outputs.version }}"
+          git tag "v${VERSION}" "${COMMIT_SHA}"
+          git push origin "v${VERSION}"
 
       - name: Publish summary
         if: always()
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          ARTIFACT: ${{ steps.build.outputs.artifact }}
+          TAG_SKIP: ${{ steps.tag-check.outputs.skip }}
+          TAG_PUSH_OUTCOME: ${{ steps.tag-push.outcome }}
+          JFROG_EXISTS: ${{ steps.jfrog-check.outputs.exists }}
         run: |
-          VERSION="${{ steps.meta.outputs.version }}"
           if [ -z "${VERSION}" ]; then
             echo "## Publish skipped — could not extract version" >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ steps.tag-check.outputs.skip }}" = "true" ]; then
+          elif [ "${TAG_SKIP}" = "true" ]; then
             echo "## v${VERSION} already tagged — skipped" >> "$GITHUB_STEP_SUMMARY"
-          elif [ "${{ steps.tag-push.outcome }}" = "success" ]; then
-            if [ "${{ steps.jfrog-check.outputs.exists }}" = "true" ]; then
+          elif [ "${TAG_PUSH_OUTCOME}" = "success" ]; then
+            if [ "${JFROG_EXISTS}" = "true" ]; then
               echo "## v${VERSION} tagged (artifact was already in \`${JFROG_REPO}\`)" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "## Published v${VERSION} to \`${JFROG_REPO}\`" >> "$GITHUB_STEP_SUMMARY"
             fi
-            echo "Artifact: \`${{ steps.build.outputs.artifact }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "Artifact: \`${ARTIFACT}\`" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "## Publish failed for v${VERSION} — see failed steps above" >> "$GITHUB_STEP_SUMMARY"
           fi
