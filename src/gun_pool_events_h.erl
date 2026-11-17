@@ -77,20 +77,10 @@ request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := least_loaded
 request_headers(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, table := Tid}) ->
+request_end(Event=#{stream_ref := StreamRef}, State0) ->
 	State = case State0 of
 		#{StreamRef := {nofin, fin}} ->
-			_ = ets:update_counter(Tid, self(), -1),
-			maps:remove(StreamRef, State0);
-		#{StreamRef := {nofin, IsFin}} ->
-			State0#{StreamRef => {fin, IsFin}}
-	end,
-	propagate(Event, State, ?FUNCTION_NAME);
-request_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, manager := Manager}) ->
-	State = case State0 of
-		#{StreamRef := {nofin, fin}} ->
-			gen_statem:cast(Manager, {release_stream, self()}),
-			maps:remove(StreamRef, State0);
+			release_stream(StreamRef, State0);
 		#{StreamRef := {nofin, IsFin}} ->
 			State0#{StreamRef => {fin, IsFin}}
 	end,
@@ -114,20 +104,10 @@ response_headers(Event, State) ->
 response_trailers(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, table := Tid}) ->
+response_end(Event=#{stream_ref := StreamRef}, State0) ->
 	State = case State0 of
 		#{StreamRef := {fin, nofin}} ->
-			_ = ets:update_counter(Tid, self(), -1),
-			maps:remove(StreamRef, State0);
-		#{StreamRef := {IsFin, nofin}} ->
-			State0#{StreamRef => {IsFin, fin}}
-	end,
-	propagate(Event, State, ?FUNCTION_NAME);
-response_end(Event=#{stream_ref := StreamRef}, State0=#{strategy := least_loaded, manager := Manager}) ->
-	State = case State0 of
-		#{StreamRef := {fin, nofin}} ->
-			gen_statem:cast(Manager, {release_stream, self()}),
-			maps:remove(StreamRef, State0);
+			release_stream(StreamRef, State0);
 		#{StreamRef := {IsFin, nofin}} ->
 			State0#{StreamRef => {IsFin, fin}}
 	end,
@@ -160,16 +140,11 @@ origin_changed(Event, State) ->
 %% A cancelled stream (locally cancelled or reset by the remote
 %% endpoint) will never receive the request_end/response_end pair
 %% that normally releases it, so we must release it here.
-cancel(Event=#{stream_ref := StreamRef}, State0=#{strategy := random, table := Tid}) ->
+cancel(Event=#{stream_ref := StreamRef}, State0) ->
 	State = case maps:is_key(StreamRef, State0) of
-		true ->
-			_ = ets:update_counter(Tid, self(), -1),
-			maps:remove(StreamRef, State0);
-		false ->
-			State0
+		true -> release_stream(StreamRef, State0);
+		false -> State0
 	end,
-	propagate(Event, State, ?FUNCTION_NAME);
-cancel(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
 disconnect(Event, State=#{strategy := random, table := Tid}) ->
@@ -191,3 +166,14 @@ propagate(Event, State=#{event_handler := {Mod, ModState0}}, Fun) ->
 	State#{event_handler => {Mod, ModState}};
 propagate(_, State, _) ->
 	State.
+
+%% Release a stream that is done, however it ended: normal completion,
+%% local cancellation, or a remote reset. For the random strategy the
+%% stream count lives directly in ETS. For the least_loaded strategy
+%% the manager owns the count and is notified instead.
+release_stream(StreamRef, State0=#{strategy := random, table := Tid}) ->
+	_ = ets:update_counter(Tid, self(), -1),
+	maps:remove(StreamRef, State0);
+release_stream(StreamRef, State0=#{strategy := least_loaded, manager := Manager}) ->
+	gen_statem:cast(Manager, {release_stream, self()}),
+	maps:remove(StreamRef, State0).
