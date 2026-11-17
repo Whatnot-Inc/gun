@@ -62,8 +62,7 @@ end_per_suite(_) ->
 		max_streams_h2_size_1_retry_least_loaded,
 		max_streams_h2_size_2_least_loaded,
 		max_streams_h2_size_2_retry_least_loaded,
-		reconnect_h1_least_loaded,
-		least_loaded_routing_least_loaded
+		reconnect_h1_least_loaded
 	],
 	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners],
 	ok.

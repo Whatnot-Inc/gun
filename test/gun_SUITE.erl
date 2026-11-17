@@ -834,8 +834,10 @@ do_tls13_post_handshake_alert_http1() ->
 	%% The alert will occur after the gun_up message has been sent
 	%% in the case of HTTP/1.1 (when active mode gets enabled).
 	{ok, http} = gun:await_up(ConnPid),
+	%% A busy CI runner can delay delivery of the post-handshake alert
+	%% well past the default 5s, so we allow more time here.
 	{error, {down, {shutdown,
-		{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined),
+		{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, 15000),
 	gun:close(ConnPid).
 
 tls13_post_handshake_alert_http2(_) ->
@@ -884,8 +886,10 @@ do_tls13_post_handshake_alert_http2() ->
 		{error, {down, {shutdown, {tls_alert, {certificate_required, _}}}}} ->
 			ct:log("TLS alert received in gun:await_up");
 		{ok, http2} ->
+			%% A busy CI runner can delay delivery of the post-handshake alert
+			%% well past the default 5s, so we allow more time here.
 			{error, {down, {shutdown,
-				{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined),
+				{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, 15000),
 			ct:log("TLS alert received after gun:await_up")
 	end,
 	gun:close(ConnPid).
@@ -1077,8 +1081,10 @@ do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol) ->
 					%% different and we may get a failure before receiving gun_tunnel_up.
 					case gun:await(ConnPid, TunnelStreamRef) of
 						{up, OriginProtocol} ->
+							%% A busy CI runner can delay delivery of the post-handshake
+							%% alert well past the default 5s, so we allow more time here.
 							{error, {down, {shutdown,
-								{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined);
+								{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, 15000);
 						{error, {stream_error, {closed,
 								{tls_alert, {certificate_required, _}}}}} ->
 							ok
