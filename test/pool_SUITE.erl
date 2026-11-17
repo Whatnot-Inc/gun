@@ -41,7 +41,7 @@ groups() ->
 		stop_pool,
 		degraded_configuration_error
 	],
-	[{random, [], Tests ++ [metrics_idle, metrics_streams]},
+	[{random, [], Tests ++ [metrics_idle, metrics_streams, cancel_releases_stream_slot]},
 	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin, metrics_undefined]}].
 
 init_per_suite(Config) ->
@@ -58,6 +58,7 @@ end_per_suite(_) ->
 		max_streams_h2_size_2_retry_random,
 		reconnect_h1_random,
 		metrics_streams_random,
+		cancel_releases_stream_slot_random,
 		max_streams_h2_size_1_least_loaded,
 		max_streams_h2_size_1_retry_least_loaded,
 		max_streams_h2_size_2_least_loaded,
@@ -590,6 +591,34 @@ metrics_streams(Config) ->
 	%% Poll until event handler has counted all 5 streams and manager has processed SETTINGS.
 	ok = wait_for_metrics(Authority, Scope, #{size => 1, active => 1, streams => 5, full => 1,
 		high => 1, max_streams => 5}).
+
+cancel_releases_stream_slot(Config) ->
+	doc("Confirm cancelling a stream frees its slot in the random "
+		"strategy's stream count, instead of leaking it until the "
+		"connection itself disconnects."),
+	Listener = listener_name(?FUNCTION_NAME, Config),
+	ProtoOpts = do_proto_opts(),
+	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{max_concurrent_streams => 5}),
+	Port = ranch:get_port(Listener),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope,
+		lookup_strategy => random,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% Fill the single connection to max capacity.
+	PoolStreamRefs = [begin
+		{async, PoolStreamRef} = gun_pool:get("/delay", #{<<"host">> => Authority},
+			#{scope => Scope}),
+		PoolStreamRef
+	end || _ <- lists:seq(1, 5)],
+	ok = wait_for_metrics(Authority, Scope, #{streams => 5, full => 1}),
+	ok = gun_pool:cancel(hd(PoolStreamRefs)),
+	%% Without releasing the slot on cancel, this would time out at streams => 5.
+	ok = wait_for_metrics(Authority, Scope, #{streams => 4, full => 0}).
 
 metrics_undefined(Config) ->
 	doc("Confirm metrics returns undefined for the least_loaded strategy."),
