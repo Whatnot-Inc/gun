@@ -137,9 +137,6 @@ protocol_changed(Event, State) ->
 origin_changed(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-%% A cancelled stream (locally cancelled or reset by the remote
-%% endpoint) will never receive the request_end/response_end pair
-%% that normally releases it, so we must release it here.
 cancel(Event=#{stream_ref := StreamRef}, State0) ->
 	State = case maps:is_key(StreamRef, State0) of
 		true -> release_stream(StreamRef, State0);
