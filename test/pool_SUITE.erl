@@ -41,7 +41,8 @@ groups() ->
 		stop_pool,
 		degraded_configuration_error
 	],
-	[{random, [], Tests ++ [metrics_idle, metrics_streams, cancel_releases_stream_slot]},
+	[{random, [], Tests ++ [metrics_idle, metrics_streams, cancel_releases_stream_slot,
+		kill_conn_releases_stream_count]},
 	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin, metrics_undefined]}].
 
 init_per_suite(Config) ->
@@ -59,6 +60,7 @@ end_per_suite(_) ->
 		reconnect_h1_random,
 		metrics_streams_random,
 		cancel_releases_stream_slot_random,
+		kill_conn_releases_stream_count_random,
 		max_streams_h2_size_1_least_loaded,
 		max_streams_h2_size_1_retry_least_loaded,
 		max_streams_h2_size_2_least_loaded,
@@ -386,6 +388,36 @@ kill_restart_h2(Config) ->
 	end || {async, StreamRef} <- Streams2].
 
 %% @todo kill_restart_ws
+
+kill_conn_releases_stream_count(Config) ->
+	doc("Confirm a connection killed while streams are still in flight "
+		"does not leave its stream count behind forever in the "
+		"random strategy's ETS table."),
+	Listener = listener_name(?FUNCTION_NAME, Config),
+	ProtoOpts = do_proto_opts(),
+	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{max_concurrent_streams => 5}),
+	Port = ranch:get_port(Listener),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => Scope,
+		lookup_strategy => random,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{async, {ConnPid, _}} = gun_pool:get("/delay", #{<<"host">> => Authority},
+		#{scope => Scope}),
+	[gun_pool:get("/delay", #{<<"host">> => Authority}, #{scope => Scope})
+		|| _ <- lists:seq(1, 2)],
+	ok = wait_for_metrics(Authority, Scope, #{streams => 3}),
+	%% Kill the connection the way an external supervisor or a crash
+	%% would.
+	MRef = monitor(process, ConnPid),
+	exit(ConnPid, kill),
+	receive {'DOWN', MRef, process, ConnPid, _} -> ok end,
+	gun_pool:await_up(ManagerPid),
+	ok = wait_for_metrics(Authority, Scope, #{streams => 0}).
 
 reconnect_h1(Config) ->
 	doc("Confirm the Gun process reconnects automatically for HTTP/1.1 connections."),

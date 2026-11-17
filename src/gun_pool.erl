@@ -820,8 +820,12 @@ handle_common(Type, Event, StateName, StateData) ->
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 
-remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random},
+remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random, table := Tid},
 		conns=Conns, conns_meta=ConnsMeta}) ->
+	%% The event handler deletes this row on a clean disconnect, but a
+	%% crash or an external kill can end the connection process without
+	%% ever running that code.
+	ets:delete(Tid, ConnPid),
 	StateData#state{
 		conns=maps:remove(ConnPid, Conns),
 		conns_meta=maps:remove(ConnPid, ConnsMeta)
