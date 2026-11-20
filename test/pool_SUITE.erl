@@ -21,10 +21,7 @@
 -import(gun_test, [receive_from/1]).
 
 all() ->
-	[{group, random}].
-
-groups() ->
-	Tests = [
+	[
 		hello_pool_h1,
 		hello_pool_h2,
 		hello_pool_ws,
@@ -39,10 +36,13 @@ groups() ->
 		reconnect_h1,
 		reconnect_h2,
 		stop_pool,
-		degraded_configuration_error
-	],
-	[{random, [], Tests ++ [metrics_idle, metrics_streams, cancel_releases_stream_slot,
-		kill_conn_releases_stream_count, cancel_h1_survives_in_flight_response]}].
+		degraded_configuration_error,
+		metrics_idle,
+		metrics_streams,
+		cancel_releases_stream_slot,
+		kill_conn_releases_stream_count,
+		cancel_h1_survives_in_flight_response
+	].
 
 init_per_suite(Config) ->
 	{ok, _} = cowboy:start_clear({?MODULE, tcp}, [], do_proto_opts()),
@@ -50,25 +50,19 @@ init_per_suite(Config) ->
 	[{port, Port}|Config].
 
 end_per_suite(_) ->
-	%% Stop listeners started by individual test cases in both groups.
+	%% Stop listeners started by individual test cases.
 	ExtraListeners = [
-		max_streams_h2_size_1_random,
-		max_streams_h2_size_1_retry_random,
-		max_streams_h2_size_2_random,
-		max_streams_h2_size_2_retry_random,
-		reconnect_h1_random,
-		metrics_streams_random,
-		cancel_releases_stream_slot_random,
-		kill_conn_releases_stream_count_random,
-		cancel_h1_survives_in_flight_response_random
+		max_streams_h2_size_1,
+		max_streams_h2_size_1_retry,
+		max_streams_h2_size_2,
+		max_streams_h2_size_2_retry,
+		reconnect_h1,
+		metrics_streams,
+		cancel_releases_stream_slot,
+		kill_conn_releases_stream_count,
+		cancel_h1_survives_in_flight_response
 	],
 	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners],
-	ok.
-
-init_per_group(GroupName, Config) ->
-	[{lookup_strategy, GroupName} | Config].
-
-end_per_group(_, _) ->
 	ok.
 
 do_proto_opts() ->
@@ -81,30 +75,19 @@ do_proto_opts() ->
 		env => #{dispatch => cowboy_router:compile([{'_', Routes}])}
 	}.
 
-%% Builds a per-group listener name to avoid collisions between group runs.
-listener_name(FuncName, Config) ->
-	Strategy = config(lookup_strategy, Config),
-	list_to_atom(atom_to_list(FuncName) ++ "_" ++ atom_to_list(Strategy)).
-
-%% Builds a per-group scope to avoid ETS key collisions between group runs.
-scope(FuncName, Config) ->
-	{config(lookup_strategy, Config), FuncName}.
-
 %% Tests.
 
 hello_pool_h1(Config) ->
 	doc("Confirm the pool can be used for HTTP/1.1 connections."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy
+		scope => ?FUNCTION_NAME
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => ["localhost:", integer_to_binary(Port)]},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 8)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -114,16 +97,14 @@ hello_pool_h1(Config) ->
 hello_pool_h2(Config) ->
 	doc("Confirm the pool can be used for HTTP/2 connections."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy
+		scope => ?FUNCTION_NAME
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => ["localhost:", integer_to_binary(Port)]},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 800)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -133,7 +114,6 @@ hello_pool_h2(Config) ->
 hello_pool_ws(Config) ->
 	doc("Confirm the pool can be used for HTTP/1.1 connections upgraded to Websocket."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{
 			protocols => [http],
@@ -142,8 +122,7 @@ hello_pool_ws(Config) ->
 				user_opts => self()
 			}
 		},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy,
+		scope => ?FUNCTION_NAME,
 		setup_fun => {fun
 			(ConnPid, {gun_up, _, http}, SetupState) ->
 				_ = gun:ws_upgrade(ConnPid, "/ws"),
@@ -158,7 +137,7 @@ hello_pool_ws(Config) ->
 	gun_pool:await_up(ManagerPid),
 	_ = [gun_pool:ws_send({text, <<"Hello world!">>}, #{
 		authority => ["localhost:", integer_to_binary(Port)],
-		scope => scope(?FUNCTION_NAME, Config)
+		scope => ?FUNCTION_NAME
 	}) || _ <- lists:seq(1, 8)],
 	%% The pool_ws_handler module sends frames back to us.
 	_ = [receive
@@ -170,58 +149,51 @@ max_streams_h1(Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/1.1 connections."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy,
+		scope => ?FUNCTION_NAME,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
 	{async, _} = gun_pool:get("/delay",
-		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
+		#{<<"host">> => Authority}, #{scope => ?FUNCTION_NAME}),
 	timer:sleep(500),
 	{error, no_connection_available, _} = gun_pool:get("/delay",
-		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}).
+		#{<<"host">> => Authority}, #{scope => ?FUNCTION_NAME}).
 
 max_streams_h1_retry(Config) ->
 	doc("Confirm connection checkout is retried when the maximum number "
 		"of streams is reached for HTTP/1.1 connections."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy,
+		scope => ?FUNCTION_NAME,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
 	{async, _} = gun_pool:get("/delay",
-		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
+		#{<<"host">> => Authority}, #{scope => ?FUNCTION_NAME}),
 	timer:sleep(500),
 	{error, no_connection_available, _} = gun_pool:get("/delay",
-		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
+		#{<<"host">> => Authority}, #{scope => ?FUNCTION_NAME}),
 	{async, _} = gun_pool:get("/delay", #{<<"host">> => Authority}, #{
 		checkout_retry => [100, 500, 500, 500, 500, 500, 500],
-		scope => scope(?FUNCTION_NAME, Config)
+		scope => ?FUNCTION_NAME
 	}).
 
-max_streams_h2_size_1(Config) ->
+max_streams_h2_size_1(_Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(lookup_strategy, Config),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{
 		max_concurrent_streams => 5
 	}),
-	Port = ranch:get_port(Listener),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		lookup_strategy => Strategy,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -229,20 +201,17 @@ max_streams_h2_size_1(Config) ->
 	timer:sleep(500),
 	{error, no_connection_available, _} = gun_pool:get("/delay", #{<<"host">> => Authority}).
 
-max_streams_h2_size_1_retry(Config) ->
+max_streams_h2_size_1_retry(_Config) ->
 	doc("Confirm connection checkout is retried when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(lookup_strategy, Config),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{
 		max_concurrent_streams => 5
 	}),
-	Port = ranch:get_port(Listener),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		lookup_strategy => Strategy,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -253,20 +222,17 @@ max_streams_h2_size_1_retry(Config) ->
 		checkout_retry => [100, 500, 500, 500, 500, 500, 500]
 	}).
 
-max_streams_h2_size_2(Config) ->
+max_streams_h2_size_2(_Config) ->
 	doc("Confirm requests are rejected when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(lookup_strategy, Config),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{
 		max_concurrent_streams => 5
 	}),
-	Port = ranch:get_port(Listener),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		lookup_strategy => Strategy,
 		size => 2
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -279,20 +245,17 @@ max_streams_h2_size_2(Config) ->
 	timer:sleep(500),
 	{error, no_connection_available, _} = gun_pool:get("/delay", #{<<"host">> => Authority}).
 
-max_streams_h2_size_2_retry(Config) ->
+max_streams_h2_size_2_retry(_Config) ->
 	doc("Confirm connection checkout is retried when the maximum number "
 		"of streams is reached for HTTP/2 connections."),
-	Strategy = config(lookup_strategy, Config),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{
 		max_concurrent_streams => 5
 	}),
-	Port = ranch:get_port(Listener),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		lookup_strategy => Strategy,
 		size => 2
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -312,17 +275,15 @@ kill_restart_h1(Config) ->
 	doc("Confirm the Gun process is restarted and the pool operational "
 		"after an HTTP/1.1 Gun process has crashed."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy
+		scope => ?FUNCTION_NAME
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => Authority},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 8)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -338,7 +299,7 @@ kill_restart_h1(Config) ->
 	gun_pool:await_up(ManagerPid),
 	Streams2 = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => Authority},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 8)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -349,17 +310,15 @@ kill_restart_h2(Config) ->
 	doc("Confirm the Gun process is restarted and the pool operational "
 		"after an HTTP/2 Gun process has crashed."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy
+		scope => ?FUNCTION_NAME
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => Authority},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 800)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -375,7 +334,7 @@ kill_restart_h2(Config) ->
 	gun_pool:await_up(ManagerPid),
 	Streams2 = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => Authority},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 800)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -384,20 +343,18 @@ kill_restart_h2(Config) ->
 
 %% @todo kill_restart_ws
 
-kill_conn_releases_stream_count(Config) ->
+kill_conn_releases_stream_count(_Config) ->
 	doc("Confirm a connection killed while streams are still in flight "
 		"does not leave its stream count behind forever in the "
-		"random strategy's ETS table."),
-	Listener = listener_name(?FUNCTION_NAME, Config),
+		"pool's ETS table."),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{max_concurrent_streams => 5}),
-	Port = ranch:get_port(Listener),
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{max_concurrent_streams => 5}),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
-	Scope = scope(?FUNCTION_NAME, Config),
+	Scope = ?FUNCTION_NAME,
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => Scope,
-		lookup_strategy => random,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -414,19 +371,16 @@ kill_conn_releases_stream_count(Config) ->
 	gun_pool:await_up(ManagerPid),
 	ok = wait_for_metrics(Authority, Scope, #{streams => 0}).
 
-reconnect_h1(Config) ->
+reconnect_h1(_Config) ->
 	doc("Confirm the Gun process reconnects automatically for HTTP/1.1 connections."),
-	Strategy = config(lookup_strategy, Config),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{
 		idle_timeout => 500
 	}),
-	Port = ranch:get_port(Listener),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
-		conn_opts => #{protocols => [http]},
-		lookup_strategy => Strategy
+		conn_opts => #{protocols => [http]}
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/", #{<<"host">> => Authority}) || _ <- lists:seq(1, 8)],
@@ -447,17 +401,15 @@ reconnect_h1(Config) ->
 reconnect_h2(Config) ->
 	doc("Confirm the Gun process reconnects automatically for HTTP/2 connections."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	Authority = ["localhost:", integer_to_binary(Port)],
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy
+		scope => ?FUNCTION_NAME
 	}),
 	gun_pool:await_up(ManagerPid),
 	Streams1 = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => Authority},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 800)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -469,7 +421,7 @@ reconnect_h2(Config) ->
 	gun_pool:await_up(ManagerPid),
 	Streams2 = [{async, _} = gun_pool:get("/",
 		#{<<"host">> => Authority},
-		#{scope => scope(?FUNCTION_NAME, Config)}
+		#{scope => ?FUNCTION_NAME}
 	) || _ <- lists:seq(1, 800)],
 	_ = [begin
 		{response, nofin, 200, _} = gun_pool:await(StreamRef),
@@ -481,13 +433,11 @@ reconnect_h2(Config) ->
 stop_pool(Config) ->
 	doc("Confirm the pool can be stopped."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy
+		scope => ?FUNCTION_NAME
 	}),
 	gun_pool:await_up(ManagerPid),
-	gun_pool:stop_pool("localhost", Port, #{scope => scope(?FUNCTION_NAME, Config)}).
+	gun_pool:stop_pool("localhost", Port, #{scope => ?FUNCTION_NAME}).
 
 degraded_configuration_error(Config) ->
 	case os:type() of
@@ -501,12 +451,10 @@ do_degraded_configuration_error(Config) ->
 	doc("Confirm the pool ends up in a degraded state "
 		"when connection is impossible because of bad configuration."),
 	Port = config(port, Config),
-	Strategy = config(lookup_strategy, Config),
 	%% We attempt to connect to an unreachable IP.
 	{ok, ManagerPid} = gun_pool:start_pool({20, 20, 20, 1}, Port, #{
 		conn_opts => #{tcp_opts => [{ip, {127, 0, 0, 1}}]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => Strategy,
+		scope => ?FUNCTION_NAME,
 		size => 1
 	}),
 	%% Wait for the lookup/connect to fail.
@@ -514,18 +462,17 @@ do_degraded_configuration_error(Config) ->
 	{degraded, #{conns := Conns}} = gun_pool:info(ManagerPid),
 	true = Conns =:= #{},
 	%% We can stop the pool even if degraded.
-	gun_pool:stop_pool({20, 20, 20, 1}, Port, #{scope => scope(?FUNCTION_NAME, Config)}).
+	gun_pool:stop_pool({20, 20, 20, 1}, Port, #{scope => ?FUNCTION_NAME}).
 
 metrics_idle(Config) ->
 	doc("Confirm pool metrics reflect active connections and zero streams when idle."),
 	Port = config(port, Config),
 	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
-	Scope = scope(?FUNCTION_NAME, Config),
+	Scope = ?FUNCTION_NAME,
 	Size = 3,
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => Scope,
-		lookup_strategy => random,
 		size => Size
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -541,18 +488,16 @@ metrics_idle(Config) ->
 	[#{size := Size, active := Size, streams := 0, full := 0, high := 0,
 		authority := Authority, scope := Scope}] = gun_pool:metrics(Scope).
 
-metrics_streams(Config) ->
+metrics_streams(_Config) ->
 	doc("Confirm pool metrics count in-flight streams and detect full/high connections."),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{max_concurrent_streams => 5}),
-	Port = ranch:get_port(Listener),
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{max_concurrent_streams => 5}),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
-	Scope = scope(?FUNCTION_NAME, Config),
+	Scope = ?FUNCTION_NAME,
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => Scope,
-		lookup_strategy => random,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -563,20 +508,18 @@ metrics_streams(Config) ->
 	ok = wait_for_metrics(Authority, Scope, #{size => 1, active => 1, streams => 5, full => 1,
 		high => 1, max_streams => 5}).
 
-cancel_releases_stream_slot(Config) ->
-	doc("Confirm cancelling a stream frees its slot in the random "
-		"strategy's stream count, instead of leaking it until the "
+cancel_releases_stream_slot(_Config) ->
+	doc("Confirm cancelling a stream frees its slot in the pool's "
+		"stream count, instead of leaking it until the "
 		"connection itself disconnects."),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts#{max_concurrent_streams => 5}),
-	Port = ranch:get_port(Listener),
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{max_concurrent_streams => 5}),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
-	Scope = scope(?FUNCTION_NAME, Config),
+	Scope = ?FUNCTION_NAME,
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http2]},
 		scope => Scope,
-		lookup_strategy => random,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),
@@ -591,19 +534,17 @@ cancel_releases_stream_slot(Config) ->
 	%% Without releasing the slot on cancel, this would time out at streams => 5.
 	ok = wait_for_metrics(Authority, Scope, #{streams => 4, full => 0}).
 
-cancel_h1_survives_in_flight_response(Config) ->
+cancel_h1_survives_in_flight_response(_Config) ->
 	doc("Cancelling an HTTP/1.1 stream doesn't crash the connection "
 		"once the server's response for it still arrives."),
-	Listener = listener_name(?FUNCTION_NAME, Config),
 	ProtoOpts = do_proto_opts(),
-	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts),
-	Port = ranch:get_port(Listener),
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts),
+	Port = ranch:get_port(?FUNCTION_NAME),
 	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
-	Scope = scope(?FUNCTION_NAME, Config),
+	Scope = ?FUNCTION_NAME,
 	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
 		conn_opts => #{protocols => [http]},
 		scope => Scope,
-		lookup_strategy => random,
 		size => 1
 	}),
 	gun_pool:await_up(ManagerPid),

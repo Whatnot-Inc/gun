@@ -105,8 +105,7 @@
 	conn_opts => gun:opts(),
 	scope => any(),
 	setup_fun => {fun((pid(), setup_msg(), any()) -> any()), any()},
-	size => non_neg_integer(),
-	lookup_strategy => random
+	size => non_neg_integer()
 }.
 -export_type([opts/0]).
 
@@ -154,8 +153,8 @@
 	conns :: #{pid() => down | {setup, any()} | {up, http | http2 | ws | raw, map()}},
 	conns_meta = #{} :: meta(),
 	await_up = [] :: [{pid(), any()}],
-	lookup :: #{strategy := random, table := ets:tid(),
-	            active := atomics:atomics_ref(), pool_key := {any(), binary()}}
+	lookup :: #{table := ets:tid(), active := atomics:atomics_ref(),
+	            pool_key := {any(), binary()}}
 }).
 
 %% Pool management.
@@ -210,7 +209,7 @@ info(Authority, Scope) ->
 			gen_statem:call(ManagerPid, info)
 	end.
 
-%% Read pool metrics from ETS without calling the manager (random pools only).
+%% Read pool metrics from ETS without calling the manager.
 %% Counters may reflect a torn snapshot across connections but no call is made.
 -spec metrics() -> [map()].
 metrics() ->
@@ -576,18 +575,15 @@ init({Host, Port, Opts}) ->
 	true = ets:insert_new(gun_pools, {PoolKey, self()}),
 	Size = maps:get(size, Opts, 8),
 	%% @todo Only start processes in static mode.
-	Lookup = case maps:get(lookup_strategy, Opts, random) of
-		random ->
-			Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
-			Active = atomics:new(1, [{signed, false}]),
-			ets:insert(gun_pool_counters, {PoolKey, #{
-				table => Tid,
-				size => Size,
-				max_streams => infinity,
-				active => Active
-			}}),
-			#{strategy => random, table => Tid, active => Active, pool_key => PoolKey}
-	end,
+	Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
+	Active = atomics:new(1, [{signed, false}]),
+	ets:insert(gun_pool_counters, {PoolKey, #{
+		table => Tid,
+		size => Size,
+		max_streams => infinity,
+		active => Active
+	}}),
+	Lookup = #{table => Tid, active => Active, pool_key => PoolKey},
 	ConnOpts = conn_opts(Lookup, Opts),
 	Conns = maps:from_list([begin
 		{ok, ConnPid} = gun:open(Host, Port, ConnOpts),
@@ -610,13 +606,12 @@ gun_pools_key(Host, Port, Opts) ->
 	Scope = maps:get(scope, Opts, default),
 	{Scope, iolist_to_binary(Authority)}.
 
-conn_opts(#{strategy := random, table := Tid}, Opts) ->
+conn_opts(#{table := Tid}, Opts) ->
 	ConnOpts = maps:get(conn_opts, Opts, #{}),
 	EventHandlerState = maps:with([event_handler], ConnOpts),
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
-			strategy => random,
 			table => Tid
 		}},
 		http2_opts => H2Opts#{
@@ -679,7 +674,7 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 			end
 	end.
 
-is_degraded(#state{lookup=#{strategy := random}, conns=Conns0}) ->
+is_degraded(#state{conns=Conns0}) ->
 	Conns = maps:to_list(Conns0),
 	Len = length(Conns),
 	Ups = [up || {_, {up, _, _}} <- Conns],
@@ -703,7 +698,7 @@ handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateD
 	metrics_update_max_streams(Lookup, Settings),
 	{keep_state, StateData#state{conns=Conns#{ConnPid => {up, http2, Settings}}}};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
-		StateData=#state{lookup=#{strategy := random, active := Active}, conns=Conns}) ->
+		StateData=#state{lookup=#{active := Active}, conns=Conns}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
 	atomics:sub(Active, 1, 1),
 	{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}};
@@ -711,9 +706,9 @@ handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
 handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _, StateData0) ->
 	%% gun_down fires before DOWN in normal cases and already decrements active.
 	%% Guard against sudden process death (no gun_down) where the conn is still up.
-	_ = case {maps:get(ConnPid0, StateData0#state.conns, undefined),
-			StateData0#state.lookup} of
-		{{up, _, _}, #{strategy := random, active := Active}} ->
+	_ = case maps:get(ConnPid0, StateData0#state.conns, undefined) of
+		{up, _, _} ->
+			#state{lookup=#{active := Active}} = StateData0,
 			atomics:sub(Active, 1, 1);
 		_ ->
 			ok
@@ -751,7 +746,7 @@ handle_common(Type, Event, StateName, StateData) ->
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 
-remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random, table := Tid},
+remove_down_conn(ConnPid, StateData=#state{lookup=#{table := Tid},
 		conns=Conns, conns_meta=ConnsMeta}) ->
 	%% The event handler deletes this row on a clean disconnect, but a
 	%% crash or an external kill can end the connection process without
@@ -770,7 +765,7 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random, table :=
 %% Connections are shuffled and the first one we find that has
 %% capacity is returned. The current number of streams is maintained
 %% in ETS by the event handler gun_pool_events_h.
-find_available_connection(#state{lookup=#{strategy := random, table := Tid}, conns=Conns}) ->
+find_available_connection(#state{lookup=#{table := Tid}, conns=Conns}) ->
 	I = lists:sort([{rand:uniform(), K} || K <- maps:keys(Conns)]),
 	find_available_connection_random(I, Conns, Tid).
 
@@ -818,13 +813,13 @@ terminate(Reason, StateName, #state{host=Host, port=Port, opts=Opts, await_up=Aw
 	ets:delete(gun_pool_counters, PoolKey),
 	ok.
 
-metrics_conn_up(#{strategy := random, active := Active, pool_key := PoolKey}, http) ->
+metrics_conn_up(#{active := Active, pool_key := PoolKey}, http) ->
 	atomics:add(Active, 1, 1),
 	update_pool_counter_max_streams(PoolKey, 1);
-metrics_conn_up(#{strategy := random, active := Active}, _Protocol) ->
+metrics_conn_up(#{active := Active}, _Protocol) ->
 	atomics:add(Active, 1, 1).
 
-metrics_update_max_streams(#{strategy := random, pool_key := PoolKey}, Settings) ->
+metrics_update_max_streams(#{pool_key := PoolKey}, Settings) ->
 	MaxStreams = maps:get(max_concurrent_streams, Settings, infinity),
 	update_pool_counter_max_streams(PoolKey, MaxStreams).
 
