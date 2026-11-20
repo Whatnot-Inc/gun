@@ -21,7 +21,7 @@
 -import(gun_test, [receive_from/1]).
 
 all() ->
-	[{group, random}, {group, least_loaded}].
+	[{group, random}].
 
 groups() ->
 	Tests = [
@@ -42,8 +42,7 @@ groups() ->
 		degraded_configuration_error
 	],
 	[{random, [], Tests ++ [metrics_idle, metrics_streams, cancel_releases_stream_slot,
-		kill_conn_releases_stream_count, cancel_h1_survives_in_flight_response]},
-	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin, metrics_undefined]}].
+		kill_conn_releases_stream_count, cancel_h1_survives_in_flight_response]}].
 
 init_per_suite(Config) ->
 	{ok, _} = cowboy:start_clear({?MODULE, tcp}, [], do_proto_opts()),
@@ -61,12 +60,7 @@ end_per_suite(_) ->
 		metrics_streams_random,
 		cancel_releases_stream_slot_random,
 		kill_conn_releases_stream_count_random,
-		cancel_h1_survives_in_flight_response_random,
-		max_streams_h2_size_1_least_loaded,
-		max_streams_h2_size_1_retry_least_loaded,
-		max_streams_h2_size_2_least_loaded,
-		max_streams_h2_size_2_retry_least_loaded,
-		reconnect_h1_least_loaded
+		cancel_h1_survives_in_flight_response_random
 	],
 	_ = [cowboy:stop_listener(Listener) || Listener <- ExtraListeners],
 	ok.
@@ -522,62 +516,6 @@ do_degraded_configuration_error(Config) ->
 	%% We can stop the pool even if degraded.
 	gun_pool:stop_pool({20, 20, 20, 1}, Port, #{scope => scope(?FUNCTION_NAME, Config)}).
 
-least_loaded_routing(Config) ->
-	doc("Confirm the least_loaded strategy always routes to the connection "
-		"with the fewest active streams."),
-	Port = config(port, Config),
-	Authority = ["localhost:", integer_to_binary(Port)],
-	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
-		conn_opts => #{protocols => [http2]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => least_loaded,
-		size => 2
-	}),
-	gun_pool:await_up(ManagerPid),
-	%% Occupy one connection with a slow request.
-	{async, {BusyConn, _}} = gun_pool:get("/delay",
-		#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
-	%% Send requests one at a time and await each before the next.
-	%% This keeps the idle connection at 0-1 streams, always below the
-	%% busy connection, so least_loaded must consistently pick it.
-	%% With random selection this would pass with probability ~0.1%.
-	_ = [begin
-		{async, {ConnPid, _} = PoolStreamRef} = gun_pool:get("/",
-			#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
-		true = ConnPid =/= BusyConn,
-		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
-		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef)
-	end || _ <- lists:seq(1, 10)].
-
-least_loaded_round_robin(Config) ->
-	doc("Confirm the least_loaded strategy rotates across equally-loaded "
-		"connections: with 5 connections and 5 sequential requests, every 
-		connection is used exactly once."),
-	Port = config(port, Config),
-	Authority = ["localhost:", integer_to_binary(Port)],
-	Size = 5,
-	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
-		conn_opts => #{protocols => [http2]},
-		scope => scope(?FUNCTION_NAME, Config),
-		lookup_strategy => least_loaded,
-		size => Size
-	}),
-	gun_pool:await_up(ManagerPid),
-
-	ConnPids = [begin
-		{async, {ConnPid, _} = PoolStreamRef} = gun_pool:get("/",
-			#{<<"host">> => Authority}, #{scope => scope(?FUNCTION_NAME, Config)}),
-		{response, nofin, 200, _} = gun_pool:await(PoolStreamRef),
-		{ok, <<"Hello world!">>} = gun_pool:await_body(PoolStreamRef),
-		%% The stream is released asynchronously (the event handler casts
-		%% {release_stream, _} to the manager), so wait until every connection
-		%% is back to 0 streams before issuing the next request.
-		ok = wait_all_streams_released(ManagerPid),
-		ConnPid
-	end || _ <- lists:seq(1, Size)],
-	%% Every connection must have been used exactly once.
-	Size = length(lists:usort(ConnPids)).
-
 metrics_idle(Config) ->
 	doc("Confirm pool metrics reflect active connections and zero streams when idle."),
 	Port = config(port, Config),
@@ -689,20 +627,6 @@ cancel_h1_survives_in_flight_response(Config) ->
 	{response, nofin, 200, _} = gun_pool:await(StreamRef),
 	{ok, <<"Hello world!">>} = gun_pool:await_body(StreamRef).
 
-metrics_undefined(Config) ->
-	doc("Confirm metrics returns undefined for the least_loaded strategy."),
-	Port = config(port, Config),
-	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
-	Scope = scope(?FUNCTION_NAME, Config),
-	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
-		conn_opts => #{protocols => [http2]},
-		scope => Scope,
-		lookup_strategy => least_loaded,
-		size => 1
-	}),
-	gun_pool:await_up(ManagerPid),
-	undefined = gun_pool:metrics(Authority, Scope).
-
 %% Poll until metrics match the expected map.
 %% Calls info/2 each iteration to flush pending manager messages (e.g. settings_changed).
 wait_for_metrics(Authority, Scope, Expected) ->
@@ -721,20 +645,4 @@ wait_for_metrics(Authority, Scope, Expected, N) ->
 		false ->
 			timer:sleep(20),
 			wait_for_metrics(Authority, Scope, Expected, N - 1)
-	end.
-
-%% Poll the manager until every connection's stream count is back to 0.
-wait_all_streams_released(ManagerPid) ->
-	wait_all_streams_released(ManagerPid, 100).
-
-wait_all_streams_released(_ManagerPid, 0) ->
-	{error, timeout};
-wait_all_streams_released(ManagerPid, N) ->
-	{_, #{lookup := #{stream_counts := StreamCounts}}} = gun_pool:info(ManagerPid),
-	case lists:all(fun(Count) -> Count =:= 0 end, maps:values(StreamCounts)) of
-		true ->
-			ok;
-		false ->
-			timer:sleep(10),
-			wait_all_streams_released(ManagerPid, N - 1)
 	end.
