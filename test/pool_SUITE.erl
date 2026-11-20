@@ -42,7 +42,7 @@ groups() ->
 		degraded_configuration_error
 	],
 	[{random, [], Tests ++ [metrics_idle, metrics_streams, cancel_releases_stream_slot,
-		kill_conn_releases_stream_count]},
+		kill_conn_releases_stream_count, cancel_h1_survives_in_flight_response]},
 	 {least_loaded, [], Tests ++ [least_loaded_routing, least_loaded_round_robin, metrics_undefined]}].
 
 init_per_suite(Config) ->
@@ -61,6 +61,7 @@ end_per_suite(_) ->
 		metrics_streams_random,
 		cancel_releases_stream_slot_random,
 		kill_conn_releases_stream_count_random,
+		cancel_h1_survives_in_flight_response_random,
 		max_streams_h2_size_1_least_loaded,
 		max_streams_h2_size_1_retry_least_loaded,
 		max_streams_h2_size_2_least_loaded,
@@ -651,6 +652,42 @@ cancel_releases_stream_slot(Config) ->
 	ok = gun_pool:cancel(hd(PoolStreamRefs)),
 	%% Without releasing the slot on cancel, this would time out at streams => 5.
 	ok = wait_for_metrics(Authority, Scope, #{streams => 4, full => 0}).
+
+cancel_h1_survives_in_flight_response(Config) ->
+	doc("Cancelling an HTTP/1.1 stream doesn't crash the connection "
+		"once the server's response for it still arrives."),
+	Listener = listener_name(?FUNCTION_NAME, Config),
+	ProtoOpts = do_proto_opts(),
+	{ok, _} = cowboy:start_clear(Listener, [], ProtoOpts),
+	Port = ranch:get_port(Listener),
+	Authority = iolist_to_binary(["localhost:", integer_to_binary(Port)]),
+	Scope = scope(?FUNCTION_NAME, Config),
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => Scope,
+		lookup_strategy => random,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{operational, #{conns := Conns}} = gun_pool:info(ManagerPid),
+	ConnPid = hd(maps:keys(Conns)),
+	MRef = monitor(process, ConnPid),
+	{async, PoolStreamRef} = gun_pool:get("/delay", #{<<"host">> => Authority},
+		#{scope => Scope}),
+	ok = gun_pool:cancel(PoolStreamRef),
+	%% Give the server time to reply and Gun time to drain and parse
+	%% the now-cancelled stream's response on the wire.
+	receive
+		{'DOWN', MRef, process, ConnPid, Reason} ->
+			ct:fail({connection_crashed, Reason})
+	after 3500 ->
+		ok
+	end,
+	%% The pool and its connection must still be usable afterwards.
+	{operational, _} = gun_pool:info(ManagerPid),
+	{async, StreamRef} = gun_pool:get("/", #{<<"host">> => Authority}, #{scope => Scope}),
+	{response, nofin, 200, _} = gun_pool:await(StreamRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(StreamRef).
 
 metrics_undefined(Config) ->
 	doc("Confirm metrics returns undefined for the least_loaded strategy."),
