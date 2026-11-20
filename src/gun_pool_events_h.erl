@@ -82,7 +82,9 @@ request_end(Event=#{stream_ref := StreamRef}, State0) ->
 		#{StreamRef := {nofin, fin}} ->
 			release_stream(StreamRef, State0);
 		#{StreamRef := {nofin, IsFin}} ->
-			State0#{StreamRef => {fin, IsFin}}
+			State0#{StreamRef => {fin, IsFin}};
+		_ ->
+			State0
 	end,
 	propagate(Event, State, ?FUNCTION_NAME).
 
@@ -109,7 +111,9 @@ response_end(Event=#{stream_ref := StreamRef}, State0) ->
 		#{StreamRef := {fin, nofin}} ->
 			release_stream(StreamRef, State0);
 		#{StreamRef := {IsFin, nofin}} ->
-			State0#{StreamRef => {IsFin, fin}}
+			State0#{StreamRef => {IsFin, fin}};
+		_ ->
+			State0
 	end,
 	propagate(Event, State, ?FUNCTION_NAME).
 
