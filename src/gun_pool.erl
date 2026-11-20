@@ -105,8 +105,7 @@
 	conn_opts => gun:opts(),
 	scope => any(),
 	setup_fun => {fun((pid(), setup_msg(), any()) -> any()), any()},
-	size => non_neg_integer(),
-	lookup_strategy => random | least_loaded
+	size => non_neg_integer()
 }.
 -export_type([opts/0]).
 
@@ -154,12 +153,8 @@
 	conns :: #{pid() => down | {setup, any()} | {up, http | http2 | ws | raw, map()}},
 	conns_meta = #{} :: meta(),
 	await_up = [] :: [{pid(), any()}],
-	lookup :: #{strategy := random, table := ets:tid(),
-	            active := atomics:atomics_ref(), pool_key := {any(), binary()}}
-	        | #{strategy := least_loaded, available := gb_trees:tree(),
-	            stream_counts := #{pid() => non_neg_integer()},
-	            seqs := #{pid() => non_neg_integer()}, next_seq := non_neg_integer(),
-	            up_count := non_neg_integer(), manager_pid := pid()}
+	lookup :: #{table := ets:tid(), active := atomics:atomics_ref(),
+	            pool_key := {any(), binary()}}
 }).
 
 %% Pool management.
@@ -214,7 +209,7 @@ info(Authority, Scope) ->
 			gen_statem:call(ManagerPid, info)
 	end.
 
-%% Read pool metrics from ETS without calling the manager (random pools only).
+%% Read pool metrics from ETS without calling the manager.
 %% Counters may reflect a torn snapshot across connections but no call is made.
 -spec metrics() -> [map()].
 metrics() ->
@@ -554,27 +549,16 @@ ws_send(Frames, WsSendOpts=#{authority := Authority}) ->
 %%
 %% The pool manager installs an event handler into each connection.
 %% The event handler is responsible for counting the number of
-%% active streams. For the random strategy it writes stream counts
-%% directly to the gun_pooled_conns ETS table (which is public).
-%% For the least_loaded strategy the manager itself claims a
-%% connection (incrementing its stream count) at checkout time, and
-%% the event handler casts {release_stream, ConnPid} to the manager when
-%% a stream completes, which decrements the count. The manager updates
-%% the gb_tree index and stream counts map accordingly. Claiming at checkout time
-%% avoids a race condition where the same connection would be handed
-%% out repeatedly before the event handler reported the newly opened
-%% stream.
+%% active streams. It writes stream counts directly to the
+%% gun_pooled_conns ETS table (which is public).
 %%
 %% A connection is deemed suitable if it is possible to open new
 %% streams. How many streams can be open at any one time depends
 %% on the protocol. For HTTP/2 the manager process keeps track of
 %% the connection's settings to know the maximum. For non-stream
-%% based protocols there is no limit, and claiming is a no-op.
+%% based protocols there is no limit.
 %%
-%% For the random strategy, connections are shuffled and the first
-%% suitable one is returned. For the least_loaded strategy the
-%% gb_tree is traversed in ascending order of stream count, returning
-%% the least loaded connection that still has capacity.
+%% Connections are shuffled and the first suitable one is returned.
 
 %% @todo
 %% What should happen if we always fail to reconnect? I suspect we keep the manager
@@ -591,22 +575,15 @@ init({Host, Port, Opts}) ->
 	true = ets:insert_new(gun_pools, {PoolKey, self()}),
 	Size = maps:get(size, Opts, 8),
 	%% @todo Only start processes in static mode.
-	Lookup = case maps:get(lookup_strategy, Opts, random) of
-		random ->
-			Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
-			Active = atomics:new(1, [{signed, false}]),
-			ets:insert(gun_pool_counters, {PoolKey, #{
-				table => Tid,
-				size => Size,
-				max_streams => infinity,
-				active => Active
-			}}),
-			#{strategy => random, table => Tid, active => Active, pool_key => PoolKey};
-		least_loaded ->
-		#{strategy => least_loaded, available => gb_trees:empty(),
-			stream_counts => #{}, seqs => #{}, next_seq => 0,
-			up_count => 0, manager_pid => self()}
-	end,
+	Tid = ets:new(gun_pooled_conns, [ordered_set, public]),
+	Active = atomics:new(1, [{signed, false}]),
+	ets:insert(gun_pool_counters, {PoolKey, #{
+		table => Tid,
+		size => Size,
+		max_streams => infinity,
+		active => Active
+	}}),
+	Lookup = #{table => Tid, active => Active, pool_key => PoolKey},
 	ConnOpts = conn_opts(Lookup, Opts),
 	Conns = maps:from_list([begin
 		{ok, ConnPid} = gun:open(Host, Port, ConnOpts),
@@ -629,27 +606,13 @@ gun_pools_key(Host, Port, Opts) ->
 	Scope = maps:get(scope, Opts, default),
 	{Scope, iolist_to_binary(Authority)}.
 
-conn_opts(#{strategy := random, table := Tid}, Opts) ->
+conn_opts(#{table := Tid}, Opts) ->
 	ConnOpts = maps:get(conn_opts, Opts, #{}),
 	EventHandlerState = maps:with([event_handler], ConnOpts),
 	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
 	ConnOpts#{
 		event_handler => {gun_pool_events_h, EventHandlerState#{
-			strategy => random,
 			table => Tid
-		}},
-		http2_opts => H2Opts#{
-			notify_settings_changed => true
-		}
-	};
-conn_opts(#{strategy := least_loaded, manager_pid := ManagerPid}, Opts) ->
-	ConnOpts = maps:get(conn_opts, Opts, #{}),
-	EventHandlerState = maps:with([event_handler], ConnOpts),
-	H2Opts = maps:get(http2_opts, ConnOpts, #{}),
-	ConnOpts#{
-		event_handler => {gun_pool_events_h, EventHandlerState#{
-			strategy => least_loaded,
-			manager => ManagerPid
 		}},
 		http2_opts => H2Opts#{
 			notify_settings_changed => true
@@ -702,8 +665,7 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 			metrics_conn_up(Lookup, Protocol),
 			StateData = StateData0#state{
 				conns=Conns#{ConnPid => {up, Protocol, Settings}},
-				conns_meta=ConnsMeta#{ConnPid => Meta},
-				lookup=add_up_connection(ConnPid, Lookup)
+				conns_meta=ConnsMeta#{ConnPid => Meta}
 			},
 			case is_degraded(StateData) of
 				true -> {keep_state, StateData};
@@ -712,26 +674,11 @@ degraded_setup(ConnPid, Msg, StateData0=#state{conns=Conns, conns_meta=ConnsMeta
 			end
 	end.
 
-add_up_connection(_ConnPid, Lookup=#{strategy := random}) ->
-	Lookup;
-add_up_connection(ConnPid, Lookup=#{strategy := least_loaded,
-		available := Available, stream_counts := StreamCounts,
-		seqs := Seqs, next_seq := Seq, up_count := UpCount}) ->
-	Lookup#{
-		available => gb_trees:insert({0, Seq}, ConnPid, Available),
-		stream_counts => StreamCounts#{ConnPid => 0},
-		seqs => Seqs#{ConnPid => Seq},
-		next_seq => Seq + 1,
-		up_count => UpCount + 1
-	}.
-
-is_degraded(#state{lookup=#{strategy := random}, conns=Conns0}) ->
+is_degraded(#state{conns=Conns0}) ->
 	Conns = maps:to_list(Conns0),
 	Len = length(Conns),
 	Ups = [up || {_, {up, _, _}} <- Conns],
-	Len =/= length(Ups);
-is_degraded(#state{lookup=#{strategy := least_loaded, up_count := UpCount}, conns=Conns0}) ->
-	UpCount =/= map_size(Conns0).
+	Len =/= length(Ups).
 
 operational(Type, Event, StateData) ->
 	handle_common(Type, Event, ?FUNCTION_NAME, StateData).
@@ -743,46 +690,25 @@ handle_common({call, From}, {checkout, _ReqOpts}, _,
 			{keep_state_and_data, {reply, From, undefined}};
 		ConnPid ->
 			Meta = maps:get(ConnPid, ConnsMeta, #{}),
-			%% We claim the connection immediately to avoid handing
-			%% out the same connection repeatedly before the stream
-			%% it will carry is reflected in the stream counts.
-			{keep_state, claim_connection(ConnPid, StateData),
-				{reply, From, {ConnPid, Meta}}}
+			{keep_state, StateData, {reply, From, {ConnPid, Meta}}}
 	end;
-handle_common(cast, {release_stream, ConnPid}, _, StateData) ->
-	{keep_state, adjust_stream_count(ConnPid, -1, StateData)};
 handle_common(info, {gun_notify, ConnPid, settings_changed, Settings}, _, StateData=#state{conns=Conns, lookup=Lookup}) ->
 	%% Assert that the state is correct.
 	{up, http2, _} = maps:get(ConnPid, Conns),
 	metrics_update_max_streams(Lookup, Settings),
 	{keep_state, StateData#state{conns=Conns#{ConnPid => {up, http2, Settings}}}};
 handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
-		StateData=#state{lookup=#{strategy := random, active := Active}, conns=Conns}) ->
+		StateData=#state{lookup=#{active := Active}, conns=Conns}) ->
 	{up, Protocol, _} = maps:get(ConnPid, Conns),
 	atomics:sub(Active, 1, 1),
 	{next_state, degraded, StateData#state{conns=Conns#{ConnPid => down}}};
-handle_common(info, {gun_down, ConnPid, Protocol, _Reason, _KilledStreams}, _,
-		StateData=#state{lookup=#{strategy := least_loaded, available := Available,
-				stream_counts := StreamCounts, seqs := Seqs, up_count := UpCount} = Lookup, conns=Conns}) ->
-	{up, Protocol, _} = maps:get(ConnPid, Conns),
-	OldCount = maps:get(ConnPid, StreamCounts, 0),
-	OldSeq = maps:get(ConnPid, Seqs),
-	{next_state, degraded, StateData#state{
-		conns=Conns#{ConnPid => down},
-		lookup=Lookup#{
-			available => gb_trees:delete({OldCount, OldSeq}, Available),
-			stream_counts => maps:remove(ConnPid, StreamCounts),
-			seqs => maps:remove(ConnPid, Seqs),
-			up_count => UpCount - 1
-		}
-	}};
 %% @todo We do not want to reconnect automatically when the pool is dynamic.
 handle_common(info, {'DOWN', _MRef, process, ConnPid0, Reason}, _, StateData0) ->
 	%% gun_down fires before DOWN in normal cases and already decrements active.
 	%% Guard against sudden process death (no gun_down) where the conn is still up.
-	_ = case {maps:get(ConnPid0, StateData0#state.conns, undefined),
-			StateData0#state.lookup} of
-		{{up, _, _}, #{strategy := random, active := Active}} ->
+	_ = case maps:get(ConnPid0, StateData0#state.conns, undefined) of
+		{up, _, _} ->
+			#state{lookup=#{active := Active}} = StateData0,
 			atomics:sub(Active, 1, 1);
 		_ ->
 			ok
@@ -820,7 +746,7 @@ handle_common(Type, Event, StateName, StateData) ->
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 
-remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random, table := Tid},
+remove_down_conn(ConnPid, StateData=#state{lookup=#{table := Tid},
 		conns=Conns, conns_meta=ConnsMeta}) ->
 	%% The event handler deletes this row on a clean disconnect, but a
 	%% crash or an external kill can end the connection process without
@@ -829,99 +755,23 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := random, table :=
 	StateData#state{
 		conns=maps:remove(ConnPid, Conns),
 		conns_meta=maps:remove(ConnPid, ConnsMeta)
-	};
-remove_down_conn(ConnPid, StateData=#state{lookup=#{strategy := least_loaded,
-		available := Available, stream_counts := StreamCounts,
-		seqs := Seqs, up_count := UpCount} = Lookup,
-		conns=Conns, conns_meta=ConnsMeta}) ->
-	WasUp = case maps:get(ConnPid, Conns) of
-		{up, _, _} -> true;
-		_ -> false
-	end,
-	OldCount = maps:get(ConnPid, StreamCounts, 0),
-	StateData#state{
-		conns=maps:remove(ConnPid, Conns),
-		conns_meta=maps:remove(ConnPid, ConnsMeta),
-		lookup=Lookup#{
-			available => case WasUp of
-				true -> gb_trees:delete({OldCount, maps:get(ConnPid, Seqs)}, Available);
-				false -> Available
-			end,
-			stream_counts => maps:remove(ConnPid, StreamCounts),
-			seqs => maps:remove(ConnPid, Seqs),
-			up_count => case WasUp of true -> UpCount - 1; false -> UpCount end
-		}
 	}.
-
-claim_connection(_ConnPid, StateData=#state{lookup=#{strategy := random}}) ->
-	StateData;
-claim_connection(ConnPid, StateData=#state{lookup=#{strategy := least_loaded}, conns=Conns}) ->
-	case maps:get(ConnPid, Conns) of
-		{up, ws, _} -> StateData;
-		{up, raw, _} -> StateData;
-		{up, _, _} -> adjust_stream_count(ConnPid, 1, StateData)
-	end.
-
-adjust_stream_count(ConnPid, Delta, StateData=#state{
-		lookup=#{available := Available0, stream_counts := StreamCounts,
-			seqs := Seqs, next_seq := Seq} = Lookup}) ->
-	case maps:find(ConnPid, StreamCounts) of
-		{ok, OldCount} ->
-			NewCount = OldCount + Delta,
-			OldSeq = maps:get(ConnPid, Seqs),
-			%% Assign a fresh sequence number so the just-used connection
-			%% sinks to the back of its stream-count bucket. This rotates
-			%% selection across equally-loaded connections instead of
-			%% always favouring the same (e.g. lowest-pid) subset.
-			Available1 = gb_trees:delete({OldCount, OldSeq}, Available0),
-			Available = gb_trees:insert({NewCount, Seq}, ConnPid, Available1),
-			StateData#state{lookup=Lookup#{
-				available => Available,
-				stream_counts => StreamCounts#{ConnPid => NewCount},
-				seqs => Seqs#{ConnPid => Seq},
-				next_seq => Seq + 1
-			}};
-		%% The connection may have already gone down and been cleaned up by
-		%% remove_down_conn (which drops its stream count) by the time a
-		%% release_stream is handled. Ignore it instead of crashing.
-		error ->
-			StateData
-	end.
 
 %% We return a connection that has capacity, or none if there
 %% isn't any. How we determine whether capacity is available
 %% depends on the protocol. For HTTP/2 we look into the protocol
 %% settings.
 %%
-%% For the random strategy we shuffle the connections and return
-%% the first one we find that has capacity. The current number of
-%% streams is maintained in ETS by the event handler gun_pool_events_h.
-%%
-%% For the least_loaded strategy the available connections are kept
-%% in a gb_tree ordered by stream count, so the least loaded one is
-%% simply the smallest entry. The count is maintained by the manager:
-%% it is incremented when a connection is claimed at checkout time and
-%% decremented when the event handler reports a stream has completed.
-find_available_connection(#state{lookup=#{strategy := random, table := Tid}, conns=Conns}) ->
+%% Connections are shuffled and the first one we find that has
+%% capacity is returned. The current number of streams is maintained
+%% in ETS by the event handler gun_pool_events_h.
+find_available_connection(#state{lookup=#{table := Tid}, conns=Conns}) ->
 	I = lists:sort([{rand:uniform(), K} || K <- maps:keys(Conns)]),
-	find_available_connection_random(I, Conns, Tid);
-find_available_connection(#state{lookup=#{strategy := least_loaded, available := Available},
-		conns=Conns}) ->
-	case gb_trees:is_empty(Available) of
-		true ->
-			none;
-		false ->
-			{{Count, _Seq}, ConnPid} = gb_trees:smallest(Available),
-			{up, Protocol, Settings} = maps:get(ConnPid, Conns),
-			case Count < max_streams(Protocol, Settings) of
-				true -> ConnPid;
-				false -> none
-			end
-	end.
+	find_available_connection(I, Conns, Tid).
 
-find_available_connection_random([], _, _) ->
+find_available_connection([], _, _) ->
 	none;
-find_available_connection_random([{_, ConnPid}|I], Conns, Tid) ->
+find_available_connection([{_, ConnPid}|I], Conns, Tid) ->
 	case maps:get(ConnPid, Conns) of
 		{up, Protocol, Settings} ->
 			MaxStreams = max_streams(Protocol, Settings),
@@ -933,12 +783,12 @@ find_available_connection_random([{_, ConnPid}|I], Conns, Tid) ->
 			end,
 			if
 				CurrentStreams + 1 > MaxStreams ->
-					find_available_connection_random(I, Conns, Tid);
+					find_available_connection(I, Conns, Tid);
 				true ->
 					ConnPid
 			end;
 		_ ->
-			find_available_connection_random(I, Conns, Tid)
+			find_available_connection(I, Conns, Tid)
 	end.
 
 max_streams(http, _) ->
@@ -963,19 +813,15 @@ terminate(Reason, StateName, #state{host=Host, port=Port, opts=Opts, await_up=Aw
 	ets:delete(gun_pool_counters, PoolKey),
 	ok.
 
-metrics_conn_up(#{strategy := random, active := Active, pool_key := PoolKey}, http) ->
+metrics_conn_up(#{active := Active, pool_key := PoolKey}, http) ->
 	atomics:add(Active, 1, 1),
 	update_pool_counter_max_streams(PoolKey, 1);
-metrics_conn_up(#{strategy := random, active := Active}, _Protocol) ->
-	atomics:add(Active, 1, 1);
-metrics_conn_up(_Lookup, _Protocol) ->
-	ok.
+metrics_conn_up(#{active := Active}, _Protocol) ->
+	atomics:add(Active, 1, 1).
 
-metrics_update_max_streams(#{strategy := random, pool_key := PoolKey}, Settings) ->
+metrics_update_max_streams(#{pool_key := PoolKey}, Settings) ->
 	MaxStreams = maps:get(max_concurrent_streams, Settings, infinity),
-	update_pool_counter_max_streams(PoolKey, MaxStreams);
-metrics_update_max_streams(_Lookup, _Settings) ->
-	ok.
+	update_pool_counter_max_streams(PoolKey, MaxStreams).
 
 update_pool_counter_max_streams(PoolKey, MaxStreams) ->
 	case ets:lookup(gun_pool_counters, PoolKey) of
