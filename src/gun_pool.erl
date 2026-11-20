@@ -767,11 +767,11 @@ remove_down_conn(ConnPid, StateData=#state{lookup=#{table := Tid},
 %% in ETS by the event handler gun_pool_events_h.
 find_available_connection(#state{lookup=#{table := Tid}, conns=Conns}) ->
 	I = lists:sort([{rand:uniform(), K} || K <- maps:keys(Conns)]),
-	find_available_connection_random(I, Conns, Tid).
+	find_available_connection(I, Conns, Tid).
 
-find_available_connection_random([], _, _) ->
+find_available_connection([], _, _) ->
 	none;
-find_available_connection_random([{_, ConnPid}|I], Conns, Tid) ->
+find_available_connection([{_, ConnPid}|I], Conns, Tid) ->
 	case maps:get(ConnPid, Conns) of
 		{up, Protocol, Settings} ->
 			MaxStreams = max_streams(Protocol, Settings),
@@ -783,12 +783,12 @@ find_available_connection_random([{_, ConnPid}|I], Conns, Tid) ->
 			end,
 			if
 				CurrentStreams + 1 > MaxStreams ->
-					find_available_connection_random(I, Conns, Tid);
+					find_available_connection(I, Conns, Tid);
 				true ->
 					ConnPid
 			end;
 		_ ->
-			find_available_connection_random(I, Conns, Tid)
+			find_available_connection(I, Conns, Tid)
 	end.
 
 max_streams(http, _) ->
