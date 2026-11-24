@@ -64,12 +64,8 @@ tls_handshake_start(Event, State) ->
 tls_handshake_end(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
 
-request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := random, table := Tid}) ->
+request_start(Event=#{stream_ref := StreamRef}, State=#{table := Tid}) ->
 	_ = ets:update_counter(Tid, self(), +1, {self(), 0}),
-	propagate(Event, State#{
-		StreamRef => {nofin, nofin}
-	}, ?FUNCTION_NAME);
-request_start(Event=#{stream_ref := StreamRef}, State=#{strategy := least_loaded}) ->
 	propagate(Event, State#{
 		StreamRef => {nofin, nofin}
 	}, ?FUNCTION_NAME).
@@ -148,16 +144,14 @@ cancel(Event=#{stream_ref := StreamRef}, State0) ->
 	end,
 	propagate(Event, State, ?FUNCTION_NAME).
 
-disconnect(Event, State=#{strategy := random, table := Tid}) ->
+disconnect(Event, State=#{table := Tid}) ->
 	%% The ets:delete/2 call might fail when the pool has shut down.
 	try
 		true = ets:delete(Tid, self())
 	catch _:_ ->
 		ok
 	end,
-	propagate(Event, maps:with([event_handler, strategy, table], State), ?FUNCTION_NAME);
-disconnect(Event, State=#{strategy := least_loaded}) ->
-	propagate(Event, maps:with([event_handler, strategy, manager], State), ?FUNCTION_NAME).
+	propagate(Event, maps:with([event_handler, table], State), ?FUNCTION_NAME).
 
 terminate(Event, State) ->
 	propagate(Event, State, ?FUNCTION_NAME).
@@ -169,12 +163,8 @@ propagate(_, State, _) ->
 	State.
 
 %% Release a stream that is done, however it ended: normal completion,
-%% local cancellation, or a remote reset. For the random strategy the
-%% stream count lives directly in ETS. For the least_loaded strategy
-%% the manager owns the count and is notified instead.
-release_stream(StreamRef, State0=#{strategy := random, table := Tid}) ->
+%% local cancellation, or a remote reset. The stream count lives
+%% directly in ETS.
+release_stream(StreamRef, State0=#{table := Tid}) ->
 	_ = ets:update_counter(Tid, self(), -1),
-	maps:remove(StreamRef, State0);
-release_stream(StreamRef, State0=#{strategy := least_loaded, manager := Manager}) ->
-	gen_statem:cast(Manager, {release_stream, self()}),
 	maps:remove(StreamRef, State0).
