@@ -18,7 +18,6 @@
 
 -import(ct_helper, [doc/1]).
 -import(ct_helper, [config/2]).
--import(gun_test, [receive_from/1]).
 
 all() ->
 	[
@@ -41,7 +40,8 @@ all() ->
 		metrics_streams,
 		cancel_releases_stream_slot,
 		kill_conn_releases_stream_count,
-		cancel_h1_survives_in_flight_response
+		cancel_h1_survives_in_flight_response,
+		max_streams_h2_no_wait
 	].
 
 init_per_suite(Config) ->
@@ -56,6 +56,7 @@ end_per_suite(_) ->
 		max_streams_h2_size_1_retry,
 		max_streams_h2_size_2,
 		max_streams_h2_size_2_retry,
+		max_streams_h2_no_wait,
 		reconnect_h1,
 		metrics_streams,
 		cancel_releases_stream_slot,
@@ -69,6 +70,8 @@ do_proto_opts() ->
 	Routes = [
 		{"/", hello_h, []},
 		{"/delay", delayed_hello_h, 3000},
+		{"/empty", empty_h, []},
+		{"/push", push_h, []},
 		{"/ws", ws_echo_h, []}
 	],
 	#{
@@ -144,6 +147,39 @@ hello_pool_ws(Config) ->
 		{text, <<"Hello world!">>} ->
 			ok
 	end || _ <- lists:seq(1, 8)].
+
+invalid_request_header_releases_stream(Config) ->
+	doc("A request header that raises in the caller releases the reserved stream."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	Headers = #{
+		<<"host">> => Authority,
+		<<"x-bad">> => <<"a\r\nb">>
+	},
+	Opts = #{scope => ?FUNCTION_NAME},
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http]},
+		scope => ?FUNCTION_NAME,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	%% request/5 via get, then headers/4 via post without a body.
+	try gun_pool:get("/", Headers, Opts) of
+		_ -> ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, <<"x-bad">>, _} -> ok
+	end,
+	try gun_pool:post("/", Headers, Opts) of
+		_ -> ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, <<"x-bad">>, _} -> ok
+	end,
+	{operational, #{table := Tid, conns := Conns}} = gun_pool:info(ManagerPid),
+	[{ConnPid, {up, http, _}}] = maps:to_list(Conns),
+	[{ConnPid, _, 0}] = ets:lookup(Tid, ConnPid),
+	{async, StreamRef} = gun_pool:get("/", #{<<"host">> => Authority}, Opts),
+	{response, nofin, 200, _} = gun_pool:await(StreamRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(StreamRef).
 
 max_streams_h1(Config) ->
 	doc("Confirm requests are rejected when the maximum number "
@@ -270,6 +306,41 @@ max_streams_h2_size_2_retry(_Config) ->
 	{async, _} = gun_pool:get("/delay", #{<<"host">> => Authority}, #{
 		checkout_retry => [100, 500, 500, 500, 500, 500, 500]
 	}).
+
+max_streams_h2_no_wait(_) ->
+	doc("Confirm await_up waits for HTTP/2 SETTINGS, and that the pool "
+		"never gives out a connection that is already at the server's "
+		"maximum number of streams."),
+	ProtoOpts = do_proto_opts(),
+	{ok, _} = cowboy:start_clear(?FUNCTION_NAME, [], ProtoOpts#{
+		max_concurrent_streams => 5
+	}),
+	Port = ranch:get_port(?FUNCTION_NAME),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => ?FUNCTION_NAME,
+		size => 2
+	}),
+	gun_pool:await_up(ManagerPid),
+	{operational, #{conns := Conns}} = gun_pool:info(ManagerPid),
+	true = lists:all(fun
+		({up, http2, #{max_concurrent_streams := 5}}) -> true;
+		(_) -> false
+	end, maps:values(Conns)),
+	%% We do not wait between requests: the streams must be
+	%% accounted for as soon as a connection is given out.
+	Streams = [{async, _} = gun_pool:get("/delay",
+		#{<<"host">> => Authority},
+		#{scope => ?FUNCTION_NAME}
+	) || _ <- lists:seq(1, 10)],
+	{error, no_connection_available, _} = gun_pool:get("/delay",
+		#{<<"host">> => Authority}, #{scope => ?FUNCTION_NAME}),
+	%% None of the requests may fail with too_many_streams.
+	_ = [begin
+		{response, nofin, 200, _} = gun_pool:await(StreamRef),
+		{ok, <<"Hello world!">>} = gun_pool:await_body(StreamRef)
+	end || {async, StreamRef} <- Streams].
 
 kill_restart_h1(Config) ->
 	doc("Confirm the Gun process is restarted and the pool operational "
@@ -429,6 +500,44 @@ reconnect_h2(Config) ->
 	end || {async, StreamRef} <- Streams2].
 
 %% @todo reconnect_ws
+
+push_promise_no_crash(Config) ->
+	doc("Confirm a server-pushed HTTP/2 stream does not crash "
+		"the pooled connection or change its stream counter."),
+	Port = config(port, Config),
+	Authority = ["localhost:", integer_to_binary(Port)],
+	{ok, ManagerPid} = gun_pool:start_pool("localhost", Port, #{
+		conn_opts => #{protocols => [http2]},
+		scope => ?FUNCTION_NAME,
+		size => 1
+	}),
+	gun_pool:await_up(ManagerPid),
+	{async, PoolRef={ConnPid, _}} = gun_pool:get("/push",
+		#{<<"host">> => Authority},
+		#{scope => ?FUNCTION_NAME}),
+	{push, PromisedRef1, <<"GET">>, _, _} = gun_pool:await(PoolRef),
+	{push, PromisedRef2, <<"GET">>, _, _} = gun_pool:await(PoolRef),
+	{response, nofin, 200, _} = gun_pool:await(PoolRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(PoolRef),
+	ok = do_await_pushed({ConnPid, PromisedRef1}),
+	ok = do_await_pushed({ConnPid, PromisedRef2}),
+	{operational, #{table := Tid, conns := Conns}} = gun_pool:info(ManagerPid),
+	{up, http2, _} = maps:get(ConnPid, Conns),
+	[{_, 0, 0}] = ets:lookup(Tid, ConnPid),
+	{async, NextRef} = gun_pool:get("/",
+		#{<<"host">> => Authority},
+		#{scope => ?FUNCTION_NAME}),
+	{response, nofin, 200, _} = gun_pool:await(NextRef),
+	{ok, <<"Hello world!">>} = gun_pool:await_body(NextRef).
+
+do_await_pushed(PoolRef) ->
+	case gun_pool:await(PoolRef) of
+		{response, fin, 200, _} ->
+			ok;
+		{response, nofin, 200, _} ->
+			{ok, _} = gun_pool:await_body(PoolRef),
+			ok
+	end.
 
 stop_pool(Config) ->
 	doc("Confirm the pool can be stopped."),

@@ -15,10 +15,6 @@
 -module(gun).
 -behavior(gen_statem).
 
--ifdef(OTP_RELEASE).
--compile({nowarn_deprecated_function, [{erlang, get_stacktrace, 0}]}).
--endif.
-
 %% Connection.
 -export([open/2]).
 -export([open/3]).
@@ -223,6 +219,7 @@
 	cookie_ignore_informational => boolean(),
 	flow => pos_integer(),
 	keepalive => timeout(),
+	max_headers => non_neg_integer(),
 	max_header_block_size => non_neg_integer(),
 	max_trailer_block_size => non_neg_integer(),
 	transform_header_name => fun((binary()) -> binary()),
@@ -250,12 +247,14 @@
 	initial_connection_window_size => 65535..16#7fffffff,
 	initial_stream_window_size => 0..16#7fffffff,
 	max_connection_window_size => 0..16#7fffffff,
-	max_concurrent_streams => non_neg_integer() | infinity,
-	max_decode_table_size => non_neg_integer(),
-	max_encode_table_size => non_neg_integer(),
+	max_concurrent_streams => 0..16#ffffffff | infinity,
+	max_decode_table_size => 0..16#ffffffff,
+	max_encode_table_size => 0..16#ffffffff,
 	max_fragmented_header_block_size => 16384..16#7fffffff,
 	max_frame_size_received => 16384..16777215,
 	max_frame_size_sent => 16384..16777215 | infinity,
+	max_header_list_size => 0..16#ffffffff | infinity,
+	max_headers => non_neg_integer(),
 	max_stream_window_size => 0..16#7fffffff,
 	preface_timeout => timeout(),
 	settings_timeout => timeout(),
@@ -290,11 +289,12 @@
 
 -type ws_opts() :: #{
 	closing_timeout => timeout(),
-	compress => boolean(),
+	compress => boolean() | compat,
 	default_protocol => module(),
 	flow => pos_integer(),
 	invalid_request_headers => raise | ignore,
 	keepalive => timeout(),
+	max_frame_size => pos_integer() | infinity,
 	protocols => [{binary(), module()}],
 	reply_to => pid(),
 	silence_pings => boolean(),
@@ -688,7 +688,9 @@ headers(ServerPid, Method, Path, Headers) ->
 -spec headers(pid(), iodata(), iodata(), req_headers(), req_opts()) -> stream_ref().
 headers(ServerPid, Method, Path, Headers0, ReqOpts) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_request_line(Method, Path, ReqOpts),
 	maybe_invalid_request_headers(Headers, ReqOpts),
+	maybe_validate_content_length(Headers, ReqOpts),
 	Tunnel = get_tunnel(ReqOpts),
 	StreamRef = make_stream_ref(Tunnel),
 	InitialFlow = maps:get(flow, ReqOpts, infinity),
@@ -704,6 +706,7 @@ request(ServerPid, Method, Path, Headers, Body) ->
 -spec request(pid(), iodata(), iodata(), req_headers(), iodata(), req_opts()) -> stream_ref().
 request(ServerPid, Method, Path, Headers, Body, ReqOpts) ->
 	NormHeaders = normalize_headers(Headers),
+	maybe_invalid_request_line(Method, Path, ReqOpts),
 	maybe_invalid_request_headers(NormHeaders, ReqOpts),
 	Tunnel = get_tunnel(ReqOpts),
 	StreamRef = make_stream_ref(Tunnel),
@@ -734,26 +737,73 @@ normalize_headers([{Name, Value}|Tail]) when is_atom(Name) ->
 normalize_headers(Headers) when is_map(Headers) ->
 	normalize_headers(maps:to_list(Headers)).
 
-maybe_invalid_request_headers(Headers, ReqOpts) ->
+maybe_invalid_request_line(Method, Path, ReqOpts) ->
 	case maps:get(invalid_request_headers, ReqOpts, raise) of
 		raise ->
-			case maybe_invalid_request_headers(Headers) of
-				ok ->
-					ok;
-				{error, Name} ->
-					error({invalid_request_header, Name,
-						"An invalid request header was detected."})
-			end;
+			validate_request_line(method, Method),
+			validate_request_line(path, Path);
 		ignore ->
 			ok
 	end.
 
-maybe_invalid_request_headers([{Name, Value}|Tail]) ->
-	case binary:match(iolist_to_binary(Value), [<<$\r>>, <<$\n>>]) of
-		nomatch -> maybe_invalid_request_headers(Tail);
-		_ -> {error, Name}
+validate_request_line(Type, Value) ->
+	case is_valid_request(Value) of
+		true -> ok;
+		false -> error({invalid_request_line, Type,
+			"An invalid request line was detected."})
+	end.
+
+is_valid_request(Value) ->
+	nomatch =:= binary:match(iolist_to_binary(Value), [<<$\r>>, <<$\n>>, <<0>>]).
+
+maybe_invalid_request_headers(Headers, ReqOpts) ->
+	case maps:get(invalid_request_headers, ReqOpts, raise) of
+		raise ->
+			validate_request_headers(Headers);
+		ignore ->
+			ok
+	end.
+
+validate_request_headers([{Name, Value}|Tail]) ->
+	case is_valid_request(Name) andalso is_valid_request(Value) of
+		true -> validate_request_headers(Tail);
+		false -> error({invalid_request_header, Name,
+			"An invalid request header was detected."})
 	end;
-maybe_invalid_request_headers([]) ->
+validate_request_headers([]) ->
+	ok.
+
+%% headers/5 frames the body from this value. request/6 replaces it
+%% with the size of the body, so the check lives here.
+maybe_validate_content_length(Headers, ReqOpts) ->
+	case maps:get(invalid_request_headers, ReqOpts, raise) of
+		raise ->
+			validate_content_length(Headers);
+		ignore ->
+			ok
+	end.
+
+validate_content_length(Headers) ->
+	case lists:keyfind(<<"content-length">>, 1, Headers) of
+		false ->
+			ok;
+		{_, Value} ->
+			try cow_http_hd:parse_content_length(iolist_to_binary(Value)) of
+				_ -> ok
+			catch _:_ ->
+				error({invalid_request_header, <<"content-length">>,
+					"The content-length header is invalid."})
+			end
+	end.
+
+maybe_invalid_connect_destination(#{host := Host}, ReqOpts) when not is_tuple(Host) ->
+	case maps:get(invalid_request_headers, ReqOpts, raise) of
+		raise ->
+			validate_request_line(host, Host);
+		ignore ->
+			ok
+	end;
+maybe_invalid_connect_destination(_, _) ->
 	ok.
 
 %% Streaming data.
@@ -794,6 +844,7 @@ connect(ServerPid, Destination, Headers) ->
 -spec connect(pid(), connect_destination(), req_headers(), req_opts()) -> stream_ref().
 connect(ServerPid, Destination, Headers0, ReqOpts) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_connect_destination(Destination, ReqOpts),
 	maybe_invalid_request_headers(Headers, ReqOpts),
 	Tunnel = get_tunnel(ReqOpts),
 	StreamRef = make_stream_ref(Tunnel),
@@ -1021,6 +1072,7 @@ ws_upgrade(ServerPid, Path) ->
 -spec ws_upgrade(pid(), iodata(), req_headers()) -> stream_ref().
 ws_upgrade(ServerPid, Path, Headers0) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_request_line(<<"GET">>, Path, #{invalid_request_headers => raise}),
 	maybe_invalid_request_headers(Headers, #{invalid_request_headers => raise}),
 	StreamRef = make_ref(),
 	gen_statem:cast(ServerPid, {ws_upgrade, self(), StreamRef, Path, Headers}),
@@ -1029,6 +1081,7 @@ ws_upgrade(ServerPid, Path, Headers0) ->
 -spec ws_upgrade(pid(), iodata(), req_headers(), ws_opts()) -> stream_ref().
 ws_upgrade(ServerPid, Path, Headers0, WsOpts0) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_request_line(<<"GET">>, Path, WsOpts0),
 	maybe_invalid_request_headers(Headers, WsOpts0),
 	Tunnel = get_tunnel(WsOpts0),
 	WsOpts = maps:without([invalid_request_headers, tunnel], WsOpts0),
@@ -1050,6 +1103,7 @@ start_link(Owner, Host, Port, Opts) ->
 	gen_statem:start_link(?MODULE, {Owner, Host, Port, Opts}, []).
 
 init({Owner, Host, Port, Opts}) ->
+	proc_lib:set_label({?MODULE, Host, Port}),
 	Retry = maps:get(retry, Opts, 5),
 	OriginTransport = maps:get(transport, Opts, default_transport(Port)),
 	%% When Unix Domain Sockets are used we set
@@ -1242,23 +1296,12 @@ initial_tls_handshake(_, {retries, Retries, Socket}, State0=#state{opts=Opts, or
 
 ensure_tls_opts(Protocols0, TransOpts0, OriginHost) ->
 	%% CA certificates.
-	TransOpts1 = case lists:keymember(cacerts, 1, TransOpts0) of
+	TransOpts1 = case lists:keymember(cacerts, 1, TransOpts0)
+			orelse lists:keymember(cacertfile, 1, TransOpts0) of
 		true ->
 			TransOpts0;
 		false ->
-			case lists:keymember(cacertfile, 1, TransOpts0) of
-				true ->
-					TransOpts0;
-				false ->
-					%% This function was added in OTP-25. We use it  when it is
-					%% available and keep the previous behavior when it isn't.
-					case erlang:function_exported(public_key, cacerts_get, 0) of
-						true ->
-							[{cacerts, public_key:cacerts_get()}|TransOpts0];
-						false ->
-							TransOpts0
-					end
-			end
+			[{cacerts, public_key:cacerts_get()}|TransOpts0]
 	end,
 	%% Wildcard certificate matching.
 	TransOpts2 = case lists:keymember(customize_hostname_check, 1, TransOpts1) of
@@ -1333,20 +1376,29 @@ tls_handshake(internal, {tls_handshake,
 %% the handshake succeeded and whether we need to switch to a different protocol.
 tls_handshake(info, {gun_tls_proxy, Socket, {ok, Negotiated}, {HandshakeEvent, Protocols, ReplyTo}},
 		State0=#state{socket=Socket, event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	NewProtocol0 = gun_protocols:negotiated(Negotiated, Protocols),
-	StreamRef = maps:get(stream_ref, HandshakeEvent, undefined),
-	NewProtocol1 = gun_protocols:add_stream_ref(NewProtocol0, StreamRef),
-	NewProtocol = case NewProtocol1 of
-		{NewProtocolName, NewProtocolOpts} -> {NewProtocolName, NewProtocolOpts#{tunnel_transport => tls}};
-		NewProtocolName -> {NewProtocolName, #{tunnel_transport => tls}}
-	end,
-	Protocol = gun_protocols:handler(NewProtocol),
-	reply(ReplyTo, {gun_tunnel_up, self(), StreamRef, Protocol:name()}),
-	EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
-		socket => Socket,
-		protocol => Protocol:name()
-	}, EvHandlerState0),
-	commands([{switch_protocol, NewProtocol, ReplyTo, <<>>}], State0#state{event_handler_state=EvHandlerState});
+	case gun_protocols:negotiated(Negotiated, Protocols) of
+		{error, Reason0} ->
+			Reason = {connection_error, protocol_error, Reason0},
+			EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
+				error => Reason0
+			}, EvHandlerState0),
+			commands({error, Reason}, State0#state{event_handler_state=EvHandlerState});
+		{ok, NewProtocol0} ->
+			StreamRef = maps:get(stream_ref, HandshakeEvent, undefined),
+			NewProtocol1 = gun_protocols:add_stream_ref(NewProtocol0, StreamRef),
+			NewProtocol = case NewProtocol1 of
+				{NewProtocolName, NewProtocolOpts} -> {NewProtocolName, NewProtocolOpts#{tunnel_transport => tls}};
+				NewProtocolName -> {NewProtocolName, #{tunnel_transport => tls}}
+			end,
+			Protocol = gun_protocols:handler(NewProtocol),
+			reply(ReplyTo, {gun_tunnel_up, self(), StreamRef, Protocol:name()}),
+			EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
+				socket => Socket,
+				protocol => Protocol:name()
+			}, EvHandlerState0),
+			commands([{switch_protocol, NewProtocol, ReplyTo, <<>>}],
+				State0#state{event_handler_state=EvHandlerState})
+	end;
 tls_handshake(info, {gun_tls_proxy, Socket, Error = {error, Reason}, {HandshakeEvent, _, _}},
 		State=#state{socket=Socket, event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
 	EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
@@ -1386,14 +1438,26 @@ normal_tls_handshake(Socket, State=#state{
 					}, EvHandlerState1),
 					{error, Reason, State#state{event_handler_state=EvHandlerState}};
 				NegotiatedProtocol ->
-					NewProtocol = gun_protocols:negotiated(NegotiatedProtocol, Protocols),
-					Protocol = gun_protocols:handler(NewProtocol),
-					EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
-						socket => TLSSocket,
-						protocol => Protocol:name()
-					}, EvHandlerState1),
-					{ok, TLSSocket, NewProtocol,
-						State#state{event_handler_state=EvHandlerState}}
+					case gun_protocols:negotiated(NegotiatedProtocol, Protocols) of
+						{error, Reason0} ->
+							case ssl:close(TLSSocket) of
+								ok -> ok;
+								{error, _} -> ok
+							end,
+							EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
+								error => Reason0
+							}, EvHandlerState1),
+							{error, {connection_error, protocol_error, Reason0},
+								State#state{event_handler_state=EvHandlerState}};
+						{ok, NewProtocol} ->
+							Protocol = gun_protocols:handler(NewProtocol),
+							EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
+								socket => TLSSocket,
+								protocol => Protocol:name()
+							}, EvHandlerState1),
+							{ok, TLSSocket, NewProtocol,
+								State#state{event_handler_state=EvHandlerState}}
+					end
 			end;
 		{error, Reason} ->
 			EvHandlerState = EvHandler:tls_handshake_end(HandshakeEvent#{
@@ -1444,10 +1508,14 @@ connected_data_only(Type, Event, State) ->
 connected_ws_only(cast, {ws_send, ReplyTo, StreamRef, Frames}, State=#state{
 		protocol=Protocol=gun_ws, protocol_state=ProtoState,
 		event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, EvHandlerState} = Protocol:ws_send(Frames,
-		ProtoState, dereference_stream_ref(StreamRef, State),
-		ReplyTo, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, EvHandlerState} = Protocol:ws_send(Frames,
+				ProtoState, StreamRef1, ReplyTo, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 connected_ws_only(cast, Msg, _)
 		when element(1, Msg) =:= headers; element(1, Msg) =:= request; element(1, Msg) =:= data;
 			element(1, Msg) =:= connect; element(1, Msg) =:= ws_upgrade ->
@@ -1464,42 +1532,60 @@ connected_ws_only(Type, Event, State) ->
 %% containing the target URI, instead of separate Host/Port/PathWithQs.
 connected(cast, {ping, ReplyTo, Tunnel0, PingRef},
 		State=#state{protocol=Protocol, protocol_state=ProtoState}) ->
-	Tunnel = case dereference_stream_ref(Tunnel0, State) of
-		[] -> undefined;
-		Tunnel1 -> Tunnel1
-	end,
-	Commands = Protocol:ping(ProtoState, Tunnel, ReplyTo, PingRef),
-	commands(Commands, State);
+	case dereference_stream_ref(Tunnel0, State, ping) of
+		{ok, Deref} ->
+			%% [] is the current connection when there is no HTTP intermediary.
+			Tunnel = case Deref of
+				[] -> undefined;
+				Tunnel1 -> Tunnel1
+			end,
+			Commands = Protocol:ping(ProtoState, Tunnel, ReplyTo, PingRef),
+			commands(Commands, State);
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, Tunnel0)
+	end;
 connected(cast, {headers, ReplyTo, StreamRef, Method, Path, Headers, InitialFlow},
 		State=#state{origin_host=Host, origin_port=Port,
 			protocol=Protocol, protocol_state=ProtoState, cookie_store=CookieStore0,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, CookieStore, EvHandlerState} = Protocol:headers(ProtoState,
-		dereference_stream_ref(StreamRef, State), ReplyTo,
-		Method, Host, Port, Path, Headers,
-		InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{cookie_store=CookieStore,
-		event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, CookieStore, EvHandlerState} = Protocol:headers(ProtoState,
+				StreamRef1, ReplyTo, Method, Host, Port, Path, Headers,
+				InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{cookie_store=CookieStore,
+				event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 connected(cast, {request, ReplyTo, StreamRef, Method, Path, Headers, Body, InitialFlow},
 		State=#state{origin_host=Host, origin_port=Port,
 			protocol=Protocol, protocol_state=ProtoState, cookie_store=CookieStore0,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, CookieStore, EvHandlerState} = Protocol:request(ProtoState,
-		dereference_stream_ref(StreamRef, State), ReplyTo,
-		Method, Host, Port, Path, Headers, Body,
-		InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{cookie_store=CookieStore,
-		event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, CookieStore, EvHandlerState} = Protocol:request(ProtoState,
+				StreamRef1, ReplyTo, Method, Host, Port, Path, Headers, Body,
+				InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{cookie_store=CookieStore,
+				event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 connected(cast, {connect, ReplyTo, StreamRef, Destination, Headers, InitialFlow},
 		State=#state{origin_host=Host, origin_port=Port,
 			protocol=Protocol, protocol_state=ProtoState, cookie_store=CookieStore0,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, CookieStore, EvHandlerState} = Protocol:connect(ProtoState,
-		dereference_stream_ref(StreamRef, State), ReplyTo,
-		Destination, #{host => Host, port => Port},
-		Headers, InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{cookie_store=CookieStore,
-		event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, CookieStore, EvHandlerState} = Protocol:connect(ProtoState,
+				StreamRef1, ReplyTo, Destination, #{host => Host, port => Port},
+				Headers, InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{cookie_store=CookieStore,
+				event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 %% Public Websocket interface.
 connected(cast, {ws_upgrade, ReplyTo, StreamRef, Path, Headers}, State=#state{opts=Opts}) ->
 	WsOpts = maps:get(ws_opts, Opts, #{}),
@@ -1508,45 +1594,75 @@ connected(cast, {ws_upgrade, ReplyTo, StreamRef, Path, Headers, WsOpts},
 		State=#state{origin_host=Host, origin_port=Port,
 			protocol=Protocol, protocol_state=ProtoState, cookie_store=CookieStore0,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	EvHandlerState1 = EvHandler:ws_upgrade(#{
-		stream_ref => StreamRef,
-		reply_to => ReplyTo,
-		opts => WsOpts
-	}, EvHandlerState0),
-	%% @todo Can fail if HTTP/1.0.
-	{Commands, CookieStore, EvHandlerState} = Protocol:ws_upgrade(ProtoState,
-		dereference_stream_ref(StreamRef, State), ReplyTo,
-		Host, Port, Path, Headers, WsOpts, CookieStore0, EvHandler, EvHandlerState1),
-	commands(Commands, State#state{cookie_store=CookieStore,
-		event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			EvHandlerState1 = EvHandler:ws_upgrade(#{
+				stream_ref => StreamRef,
+				reply_to => ReplyTo,
+				opts => WsOpts
+			}, EvHandlerState0),
+			%% @todo Can fail if HTTP/1.0.
+			{Commands, CookieStore, EvHandlerState} = Protocol:ws_upgrade(ProtoState,
+				StreamRef1, ReplyTo, Host, Port, Path, Headers, WsOpts,
+				CookieStore0, EvHandler, EvHandlerState1),
+			commands(Commands, State#state{cookie_store=CookieStore,
+				event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 %% @todo Maybe better standardize the protocol callbacks argument orders.
 connected(cast, {ws_send, ReplyTo, StreamRef, Frames}, State=#state{
 		protocol=Protocol, protocol_state=ProtoState,
 		event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, EvHandlerState} = Protocol:ws_send(Frames,
-		ProtoState, dereference_stream_ref(StreamRef, State),
-		ReplyTo, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, EvHandlerState} = Protocol:ws_send(Frames,
+				ProtoState, StreamRef1, ReplyTo, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 connected(Type, Event, State) ->
 	handle_common_connected(Type, Event, ?FUNCTION_NAME, State).
+
+dereference_stream_ref(StreamRef, State) ->
+	dereference_stream_ref(StreamRef, State, stream).
 
 %% When the origin is using raw we do not dereference the stream_ref
 %% because it expects the full stream_ref to function (there's no
 %% other stream involved for this connection).
-dereference_stream_ref(StreamRef, #state{protocol=gun_raw}) ->
-	StreamRef;
-dereference_stream_ref(StreamRef, #state{intermediaries=Intermediaries}) ->
+dereference_stream_ref(StreamRef, #state{protocol=gun_raw}, _) ->
+	{ok, StreamRef};
+dereference_stream_ref(StreamRef, #state{intermediaries=Intermediaries}, Kind) ->
 	%% @todo It would be better to validate with the intermediary's stream_refs.
 	case length([http || #{protocol := http} <- Intermediaries]) of
 		0 ->
-			StreamRef;
-		N ->
+			{ok, StreamRef};
+		%% No tunnel option: ping the current connection.
+		_ when StreamRef =:= undefined ->
+			{ok, undefined};
+		%% One ref per HTTP/1.1 hop and no inner stream. That tunnel
+		%% is the current connection, so ping the protocol there.
+		N when Kind =:= ping, is_list(StreamRef), length(StreamRef) =:= N ->
+			{ok, undefined};
+		N when is_list(StreamRef), length(StreamRef) > N ->
 			{_, Tail} = lists:split(N, StreamRef),
-			case Tail of
+			{ok, case Tail of
 				[SR] -> SR;
 				_ -> Tail
-			end
+			end};
+		%% A bare reference, or a list that does not extend past the
+		%% intermediaries. Do not hand it to the protocol: that would
+		%% send the request and, for a POST, leave HTTP/1.1 unable to
+		%% send the next one.
+		_ ->
+			error
 	end.
+
+bad_tunnel_stream_ref(ReplyTo, StreamRef) ->
+	reply(ReplyTo, {gun_error, self(), StreamRef, {badstate,
+		"The stream_ref does not refer to a stream inside the tunnel."}}),
+	keep_state_and_data.
 
 %% Switch to the graceful connection close state.
 closing(State=#state{protocol=Protocol, protocol_state=ProtoState,
@@ -1595,10 +1711,14 @@ closing(Type, Event, State) ->
 handle_common_connected(cast, {data, ReplyTo, StreamRef, IsFin, Data}, _,
 		State=#state{protocol=Protocol, protocol_state=ProtoState,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, EvHandlerState} = Protocol:data(ProtoState,
-		dereference_stream_ref(StreamRef, State),
-		ReplyTo, IsFin, Data, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, EvHandlerState} = Protocol:data(ProtoState,
+				StreamRef1, ReplyTo, IsFin, Data, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 handle_common_connected(info, {timeout, TRef, Name}, _,
 		State=#state{protocol=Protocol, protocol_state=ProtoState}) ->
 	Commands = Protocol:timeout(ProtoState, Name, TRef),
@@ -1636,17 +1756,19 @@ handle_common_connected_no_input(info,
 		Msg={gun_tls_proxy, _, _, {handle_continue, StreamRef, _, _}}, _,
 		State0=#state{protocol=Protocol, protocol_state=ProtoState, cookie_store=CookieStore0,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
+	%% Gun built this ref. Failing to dereference it is a bug.
+	{ok, StreamRef1} = dereference_stream_ref(StreamRef, State0),
 	{Commands, CookieStore, EvHandlerState} = Protocol:handle_continue(
-		dereference_stream_ref(StreamRef, State0),
-		Msg, ProtoState, CookieStore0, EvHandler, EvHandlerState0),
+		StreamRef1, Msg, ProtoState, CookieStore0, EvHandler, EvHandlerState0),
 	maybe_active(commands(Commands, State0#state{cookie_store=CookieStore,
 		event_handler_state=EvHandlerState}));
 handle_common_connected_no_input(info, {handle_continue, StreamRef, Msg}, _,
 		State0=#state{protocol=Protocol, protocol_state=ProtoState, cookie_store=CookieStore0,
 			event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
+	%% Gun built this ref. Failing to dereference it is a bug.
+	{ok, StreamRef1} = dereference_stream_ref(StreamRef, State0),
 	{Commands, CookieStore, EvHandlerState} = Protocol:handle_continue(
-		dereference_stream_ref(StreamRef, State0),
-		Msg, ProtoState, CookieStore0, EvHandler, EvHandlerState0),
+		StreamRef1, Msg, ProtoState, CookieStore0, EvHandler, EvHandlerState0),
 	maybe_active(commands(Commands, State0#state{cookie_store=CookieStore,
 		event_handler_state=EvHandlerState}));
 %% Timeouts.
@@ -1663,9 +1785,14 @@ handle_common_connected_no_input(cast, {update_flow, ReplyTo, StreamRef, Flow}, 
 handle_common_connected_no_input(cast, {cancel, ReplyTo, StreamRef}, _,
 		State=#state{protocol=Protocol, protocol_state=ProtoState,
 		event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
-	{Commands, EvHandlerState} = Protocol:cancel(ProtoState,
-		dereference_stream_ref(StreamRef, State), ReplyTo, EvHandler, EvHandlerState0),
-	commands(Commands, State#state{event_handler_state=EvHandlerState});
+	case dereference_stream_ref(StreamRef, State) of
+		{ok, StreamRef1} ->
+			{Commands, EvHandlerState} = Protocol:cancel(ProtoState,
+				StreamRef1, ReplyTo, EvHandler, EvHandlerState0),
+			commands(Commands, State#state{event_handler_state=EvHandlerState});
+		error ->
+			bad_tunnel_stream_ref(ReplyTo, StreamRef)
+	end;
 handle_common_connected_no_input({call, From}, {stream_info, StreamRef}, _,
 		State=#state{intermediaries=Intermediaries0, protocol=Protocol, protocol_state=ProtoState}) ->
 	Intermediaries = [I || I=#{protocol := http} <- Intermediaries0],
@@ -1699,20 +1826,23 @@ handle_common_connected_no_input({call, From}, {stream_info, StreamRef}, _,
 					tunnel => Tunnel
 				}};
 			true ->
-				case Protocol:stream_info(ProtoState, dereference_stream_ref(StreamRef, State)) of
-					{ok, undefined} ->
-						{ok, undefined};
-					{ok, Info0} ->
-						Info = Info0#{ref => StreamRef},
-						case Intermediaries0 of
-							[] ->
-								{ok, Info};
-							_ ->
-								Tail = maps:get(intermediaries, Info, []),
-								{ok, Info#{
-									intermediaries => intermediaries_info(Intermediaries0, []) ++ Tail
-								}}
-						end
+				maybe
+					{ok, StreamRef1} ?= dereference_stream_ref(StreamRef, State),
+					true ?= StreamRef1 =/= undefined,
+					{ok, Info0=#{}} ?= Protocol:stream_info(ProtoState, StreamRef1),
+					Info = Info0#{ref => StreamRef},
+					case Intermediaries0 of
+						[] ->
+							{ok, Info};
+						_ ->
+							Tail = maps:get(intermediaries, Info, []),
+							{ok, Info#{
+								intermediaries => intermediaries_info(Intermediaries0, []) ++ Tail
+							}}
+					end
+				else
+					_ ->
+						{ok, undefined}
 				end
 		end
 	}};
@@ -1802,7 +1932,7 @@ handle_common(cast, {set_owner, CurrentOwner, NewOwner}, _,
 handle_common(cast, {set_owner, CurrentOwner, _}, _, #state{owner=CurrentOwner}) ->
 	reply(CurrentOwner, {gun_error, self(), {badstate,
 		"The owner of the connection cannot be changed when the connection is shutting down."}}),
-	keep_state_and_state;
+	keep_state_and_data;
 handle_common(cast, shutdown, StateName, State=#state{
 		status=Status, socket=Socket, transport=Transport, protocol=Protocol}) ->
 	case {Socket, Protocol} of
@@ -1845,7 +1975,7 @@ handle_common({call, From}, _, _, _) ->
 handle_common(cast, _, StateName, _) when StateName =/= connected ->
 	{keep_state_and_data, postpone};
 handle_common(Type, Event, StateName, StateData) ->
-	error_logger:error_msg("Unexpected event in state ~p of type ~p:~n~w~n~p~n",
+	logger:error("Unexpected event in state ~p of type ~p:~n~w~n~p~n",
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 

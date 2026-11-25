@@ -15,6 +15,7 @@
 -module(gun_cookies).
 
 -export([add_cookie_header/5]).
+-export([cookie_sendable/1]).
 -export([domain_match/2]).
 -export([gc/1]).
 -export([path_match/2]).
@@ -86,25 +87,57 @@
 add_cookie_header(_, _, _, Headers, Store=undefined) ->
 	{Headers, Store};
 add_cookie_header(Scheme, Authority, PathWithQs, Headers0, Store0) ->
-	#{
-		host := Host,
-		path := Path
-	} = uri_string:parse([Scheme, <<"://">>, Authority, PathWithQs]),
-	URIMap = uri_string:normalize(#{
-		scheme => Scheme,
-		host => iolist_to_binary(Host),
-		path => iolist_to_binary(Path)
-	}, [return_map]),
+	case request_target(Scheme, Authority, PathWithQs) of
+		error ->
+			{Headers0, Store0};
+		{ok, URIMap} ->
+			add_cookie_header(URIMap, Headers0, Store0)
+	end.
+
+add_cookie_header(URIMap, Headers0, Store0) ->
 	{ok, Cookies0, Store} = query(Store0, URIMap),
-	Headers = case Cookies0 of
+	%% One pair cookie/1 refuses must not discard the rest of the header.
+	%% The list store has already removed that cookie; another store may not.
+	Cookies = lists:filtermap(fun cookie_pair/1, Cookies0),
+	Headers = case Cookies of
 		[] ->
 			Headers0;
 		_ ->
-			Cookies = [{Name, Value} || #{name := Name, value := Value} <- Cookies0],
 			%% We put cookies at the end of the headers list as it's the least important header.
-			Headers0 ++ [{<<"cookie">>, cow_cookie:cookie(Cookies)}]
+			Headers0 ++ [{<<"cookie">>, lists:join(<<"; ">>, Cookies)}]
 	end,
 	{Headers, Store}.
+
+%% cookie/1 rejects a semicolon, '=' in the name, and any control
+%% other than tab. Those octets cannot go into a Cookie header.
+cookie_pair(#{name := Name, value := Value}) when is_binary(Name), is_binary(Value) ->
+	try cow_cookie:cookie([{Name, Value}]) of
+		Pair -> {true, Pair}
+	catch error:badarg ->
+		false
+	end;
+cookie_pair(_) ->
+	false.
+
+%% A path that is not a valid URI must not take the connection down.
+%% The caller simply sends or stores no cookies for that target.
+request_target(Scheme, Authority, PathWithQs) ->
+	try
+		#{host := Host, path := Path} =
+			uri_string:parse([Scheme, <<"://">>, Authority, PathWithQs]),
+		URIMap = #{path := _, host := _} = uri_string:normalize(#{
+			scheme => Scheme,
+			host => iolist_to_binary(Host),
+			path => iolist_to_binary(Path)
+		}, [return_map]),
+		{ok, URIMap}
+	catch _:_ ->
+		error
+	end.
+
+-spec cookie_sendable(map()) -> boolean().
+cookie_sendable(Cookie) ->
+	cookie_pair(Cookie) =/= false.
 
 -spec domain_match(binary(), binary()) -> boolean().
 domain_match(String, String) ->
@@ -213,8 +246,8 @@ set_cookie(Store, URI=#{host := Host}, Name, Value, Attrs) ->
 				expiry_time => infinity
 			}
 	end,
-	Domain0 = maps:get(domain, Attrs, <<>>),
-	Domain = case gun_public_suffix:match(Domain0) of
+	Domain0 = canonical_domain(maps:get(domain, Attrs, <<>>)),
+	Domain = case is_public_suffix(Domain0) of
 		false ->
 			Domain0;
 		true when Host =:= Domain0 ->
@@ -287,45 +320,97 @@ set_cookie_secure_match({Mod, State}, Match) ->
 
 set_cookie2(Store, _URI, Attrs, Cookie0) ->
 	Cookie = Cookie0#{same_site => maps:get(same_site, Attrs, default)},
-	%% This is where we would perform the same-site checks.
-	%%
-	%% It seems that an option would need to be added to Gun
-	%% in order to define the "site for cookies" value. It is
-	%% not the same as the site identified by the URI. Although
-	%% I do wonder if in the case of server push we may consider
-	%% the requested URI to be the "site for cookies", at least
-	%% by default.
-	%%
-	%% The URI argument will be used if/when the above gets
-	%% implemented.
-	set_cookie3(Store, Attrs, Cookie).
+	%% Gun has no document, so a request is same-site (RFC6265bis 5.2).
+	%% SameSite=Strict, Lax and Default are therefore stored and sent.
+	%% SameSite=None still requires the Secure attribute.
+	case Cookie of
+		#{same_site := none, secure_only := false} ->
+			{error, samesite_none_requires_secure};
+		_ ->
+			set_cookie3(Store, Attrs, Cookie)
+	end.
 
-set_cookie3(Store, Attrs, Cookie=#{name := Name,
+set_cookie3(Store, Attrs, Cookie=#{name := Name, value := Value,
 		host_only := HostOnly, secure_only := SecureOnly}) ->
 	Path = maps:get(path, Attrs, undefined),
-	case Name of
-		<<"__Secure-",_/bits>> when not SecureOnly ->
+	case known_prefix(Name) of
+		secure when not SecureOnly ->
 			{error, name_prefix_secure_requires_secure_only};
-		<<"__Host-",_/bits>> when not SecureOnly ->
+		host when not SecureOnly ->
 			{error, name_prefix_host_requires_secure_only};
-		<<"__Host-",_/bits>> when not HostOnly ->
+		host when not HostOnly ->
 			{error, name_prefix_host_requires_host_only};
-		<<"__Host-",_/bits>> when Path =/= <<"/">> ->
+		host when Path =/= <<"/">> ->
 			{error, name_prefix_host_requires_top_level_path};
+		none when Name =:= <<>> ->
+			case known_prefix(Value) of
+				none ->
+					set_cookie_store(Store, Cookie);
+				_ ->
+					{error, nameless_cookie_prefix}
+			end;
 		_ ->
 			set_cookie_store(Store, Cookie)
 	end.
 
-set_cookie_store(Store0, Cookie) ->
-	Match = maps:with([name, domain, host_only, path], Cookie),
-	case set_cookie_get_exact_match(Store0, Match) of
-		{ok, #{creation_time := CreationTime}, Store} ->
-			%% This is where we would reject a new non-HTTP cookie
-			%% if the OldCookie has http_only set to true.
-			store(Store, Cookie#{creation_time => CreationTime});
-		error ->
-			store(Store0, Cookie)
+%% Prefixes are matched case-insensitively. The rest is not.
+known_prefix(<<"__", Chars:4/binary, "-", _/bits>>) ->
+	case ascii_lower(Chars) of
+		<<"host">> -> host;
+		_ -> none
+	end;
+known_prefix(<<"__", Chars:6/binary, "-", _/bits>>) ->
+	case ascii_lower(Chars) of
+		<<"secure">> -> secure;
+		_ -> none
+	end;
+known_prefix(_) ->
+	none.
+
+is_public_suffix(Domain) ->
+	try gun_public_suffix:match(Domain)
+	catch error:badarg -> false
 	end.
+
+canonical_domain(Domain) ->
+	trim_trailing_dots(ascii_lower(Domain)).
+
+trim_trailing_dots(<<>>) ->
+	<<>>;
+trim_trailing_dots(Domain) ->
+	case binary:last(Domain) of
+		$. -> trim_trailing_dots(binary:part(Domain, 0, byte_size(Domain) - 1));
+		_ -> Domain
+	end.
+
+ascii_lower(Bin) ->
+	<< <<(ascii_lower_byte(C))>> || <<C>> <= Bin >>.
+
+ascii_lower_byte(C) when C >= $A, C =< $Z -> C + 32;
+ascii_lower_byte(C) -> C.
+
+set_cookie_store(Store0, Cookie) ->
+	%% cookie/1 would reject this value. Do not replace the cookie
+	%% already stored. An expiry in the past still deletes it.
+	case cookie_sendable(Cookie) orelse cookie_expired(Cookie) of
+		false ->
+			{ok, Store0};
+		true ->
+			Match = maps:with([name, domain, host_only, path], Cookie),
+			case set_cookie_get_exact_match(Store0, Match) of
+				{ok, #{creation_time := CreationTime}, Store} ->
+					%% This is where we would reject a new non-HTTP cookie
+					%% if the OldCookie has http_only set to true.
+					store(Store, Cookie#{creation_time => CreationTime});
+				error ->
+					store(Store0, Cookie)
+			end
+	end.
+
+cookie_expired(#{expiry_time := infinity}) ->
+	false;
+cookie_expired(#{expiry_time := ExpiryTime}) ->
+	erlang:universaltime() >= ExpiryTime.
 
 set_cookie_get_exact_match({Mod, State0}, Match) ->
 	case Mod:set_cookie_get_exact_match(State0, Match) of
@@ -356,12 +441,14 @@ set_cookie_header(_, _, _, Status, _, Store, #{cookie_ignore_informational := tr
 		when Status >= 100, Status =< 199 ->
 	Store;
 set_cookie_header(Scheme, Authority, PathWithQs, _, Headers, Store0, _) ->
-	#{host := Host, path := Path} = uri_string:parse([Scheme, <<"://">>, Authority, PathWithQs]),
-	URIMap = uri_string:normalize(#{
-		scheme => Scheme,
-		host => iolist_to_binary(Host),
-		path => iolist_to_binary(Path)
-	}, [return_map]),
+	case request_target(Scheme, Authority, PathWithQs) of
+		error ->
+			Store0;
+		{ok, URIMap} ->
+			set_cookie_header(URIMap, Headers, Store0)
+	end.
+
+set_cookie_header(URIMap, Headers, Store0) ->
 	SetCookies = [SC || {<<"set-cookie">>, SC} <- Headers],
 	lists:foldl(fun(SC, Store1) ->
 		case cow_cookie:parse_set_cookie(SC) of
@@ -410,6 +497,280 @@ session_gc_test() ->
 	{ok, Store2} = set_cookie(Store1, URIMap, N1, V1, A1),
 	{ok, Store} = session_gc(Store2),
 	{ok, [#{name := <<"p">>}], _} = query(Store, URIMap),
+	ok.
+
+max_cookies_evicts_oldest_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Access = {{2024, 1, 1}, {0, 0, 0}},
+	Store0 = gun_cookies_list:init(#{max_cookies => 3}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URI, <<"b">>, <<"1">>, #{}),
+	{ok, Store3} = set_cookie(Store2, URI, <<"c">>, <<"1">>, #{}),
+	{gun_cookies_list, State3=#{cookies := Cookies3}} = Store3,
+	Cookies4 = [case N of
+		<<"a">> -> C#{last_access_time => Access, creation_time => {{2024, 1, 1}, {0, 0, 1}}};
+		<<"b">> -> C#{last_access_time => Access, creation_time => {{2024, 1, 1}, {0, 0, 2}}};
+		<<"c">> -> C#{last_access_time => Access, creation_time => {{2024, 1, 1}, {0, 0, 3}}}
+	end || C=#{name := N} <- Cookies3],
+	Store4 = {gun_cookies_list, State3#{cookies => Cookies4}},
+	{ok, Store} = set_cookie(Store4, URI, <<"d">>, <<"1">>, #{}),
+	{ok, Cookies, _} = query(Store, URI),
+	[<<"b">>, <<"c">>, <<"d">>] = lists:sort([N || #{name := N} <- Cookies]),
+	ok.
+
+max_cookies_evicts_lru_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{max_cookies => 3}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URI, <<"b">>, <<"1">>, #{}),
+	{ok, Store3} = set_cookie(Store2, URI, <<"c">>, <<"1">>, #{}),
+	{gun_cookies_list, State3=#{cookies := Cookies3}} = Store3,
+	Cookies4 = [case N of
+		<<"a">> -> C#{last_access_time => {{2024, 1, 1}, {0, 0, 3}}};
+		<<"b">> -> C#{last_access_time => {{2024, 1, 1}, {0, 0, 1}}};
+		<<"c">> -> C#{last_access_time => {{2024, 1, 1}, {0, 0, 2}}}
+	end || C=#{name := N} <- Cookies3],
+	Store4 = {gun_cookies_list, State3#{cookies => Cookies4}},
+	{ok, Store} = set_cookie(Store4, URI, <<"d">>, <<"1">>, #{}),
+	{ok, Cookies, _} = query(Store, URI),
+	[<<"a">>, <<"c">>, <<"d">>] = lists:sort([N || #{name := N} <- Cookies]),
+	ok.
+
+max_cookies_replace_does_not_evict_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{max_cookies => 2}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URI, <<"b">>, <<"1">>, #{}),
+	{ok, Store} = set_cookie(Store2, URI, <<"a">>, <<"2">>, #{}),
+	{ok, Cookies, _} = query(Store, URI),
+	[{<<"a">>, <<"2">>}, {<<"b">>, <<"1">>}]
+		= lists:sort([{N, V} || #{name := N, value := V} <- Cookies]),
+	ok.
+
+max_cookies_expired_evicted_first_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Now = erlang:universaltime(),
+	Past = {{2020, 1, 1}, {0, 0, 0}},
+	Older = {{2019, 1, 1}, {0, 0, 0}},
+	Store0 = gun_cookies_list:init(#{max_cookies => 2}),
+	{gun_cookies_list, State0} = Store0,
+	Live = #{
+		name => <<"live">>,
+		value => <<"1">>,
+		domain => <<"example.org">>,
+		path => <<"/">>,
+		creation_time => Older,
+		last_access_time => Older,
+		expiry_time => infinity,
+		persistent => false,
+		host_only => true,
+		secure_only => false,
+		http_only => false,
+		same_site => default
+	},
+	Expired = #{
+		name => <<"exp">>,
+		value => <<"1">>,
+		domain => <<"example.org">>,
+		path => <<"/">>,
+		creation_time => Now,
+		last_access_time => Now,
+		expiry_time => Past,
+		persistent => true,
+		host_only => true,
+		secure_only => false,
+		http_only => false,
+		same_site => default
+	},
+	Store1 = {gun_cookies_list, State0#{cookies => [Expired, Live]}},
+	{ok, Store} = set_cookie(Store1, URI, <<"new">>, <<"1">>, #{}),
+	{ok, Cookies, _} = query(Store, URI),
+	[<<"live">>, <<"new">>] = lists:sort([N || #{name := N} <- Cookies]),
+	ok.
+
+max_cookies_zero_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{max_cookies => 0}),
+	{ok, Store} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{ok, [], _} = query(Store, URI),
+	ok.
+
+max_cookies_infinity_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{
+		max_cookies => infinity,
+		max_cookies_per_domain => infinity
+	}),
+	Store = lists:foldl(fun(N, S0) ->
+		{ok, S} = set_cookie(S0, URI, integer_to_binary(N), <<"v">>, #{}),
+		S
+	end, Store0, lists:seq(1, 60)),
+	{ok, Cookies, _} = query(Store, URI),
+	60 = length(Cookies),
+	ok.
+
+max_cookies_default_test() ->
+	{gun_cookies_list, #{
+		max_cookies := 50,
+		max_cookies_per_domain := 20
+	}} = gun_cookies_list:init(),
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(),
+	Store = lists:foldl(fun(N, S0) ->
+		{ok, S} = set_cookie(S0, URI, integer_to_binary(N), <<"v">>, #{}),
+		S
+	end, Store0, lists:seq(1, 21)),
+	{ok, Cookies, _} = query(Store, URI),
+	20 = length(Cookies),
+	ok.
+
+max_cookies_per_domain_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{
+		max_cookies => infinity,
+		max_cookies_per_domain => 2
+	}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URI, <<"b">>, <<"1">>, #{}),
+	{ok, Store} = set_cookie(Store2, URI, <<"c">>, <<"1">>, #{}),
+	{ok, Cookies, _} = query(Store, URI),
+	2 = length(Cookies),
+	true = lists:keymember(<<"c">>, 1, [{N, V} || #{name := N, value := V} <- Cookies]),
+	ok.
+
+max_cookies_evicts_same_domain_first_test() ->
+	URIA = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	URIB = #{scheme => <<"http">>, host => <<"example.net">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{
+		max_cookies => 2,
+		max_cookies_per_domain => infinity
+	}),
+	{ok, Store1} = set_cookie(Store0, URIA, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URIB, <<"b">>, <<"1">>, #{}),
+	{ok, Store} = set_cookie(Store2, URIA, <<"a2">>, <<"1">>, #{}),
+	{ok, CookiesA, _} = query(Store, URIA),
+	{ok, CookiesB, _} = query(Store, URIB),
+	[<<"a2">>] = [N || #{name := N} <- CookiesA],
+	[<<"b">>] = [N || #{name := N} <- CookiesB],
+	ok.
+
+max_cookies_other_domain_not_blocked_test() ->
+	URIA = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	URIB = #{scheme => <<"http">>, host => <<"example.net">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(),
+	Store1 = lists:foldl(fun(N, S0) ->
+		{ok, S} = set_cookie(S0, URIA, integer_to_binary(N), <<"v">>, #{}),
+		S
+	end, Store0, lists:seq(1, 20)),
+	{ok, Store} = set_cookie(Store1, URIB, <<"b">>, <<"1">>, #{}),
+	{ok, CookiesA, _} = query(Store, URIA),
+	{ok, CookiesB, _} = query(Store, URIB),
+	20 = length(CookiesA),
+	[<<"b">>] = [N || #{name := N} <- CookiesB],
+	ok.
+
+max_cookies_per_registrable_domain_test() ->
+	URIA = #{scheme => <<"http">>, host => <<"a.example.org">>, path => <<"/">>},
+	URIB = #{scheme => <<"http">>, host => <<"b.example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{
+		max_cookies => infinity,
+		max_cookies_per_domain => 2
+	}),
+	{ok, Store1} = set_cookie(Store0, URIA, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URIB, <<"b">>, <<"1">>, #{}),
+	{ok, Store} = set_cookie(Store2, URIA, <<"a2">>, <<"1">>, #{}),
+	{ok, CookiesA, _} = query(Store, URIA),
+	{ok, CookiesB, _} = query(Store, URIB),
+	2 = length(CookiesA) + length(CookiesB),
+	true = lists:member(<<"a2">>, [N || #{name := N} <- CookiesA]),
+	ok.
+
+max_cookies_psl_hosts_not_shared_test() ->
+	URIA = #{scheme => <<"http">>, host => <<"a.ck">>, path => <<"/">>},
+	URIB = #{scheme => <<"http">>, host => <<"b.ck">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{
+		max_cookies => infinity,
+		max_cookies_per_domain => 2
+	}),
+	{ok, Store1} = set_cookie(Store0, URIA, <<"a1">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URIA, <<"a2">>, <<"1">>, #{}),
+	{ok, Store3} = set_cookie(Store2, URIB, <<"b1">>, <<"1">>, #{}),
+	{ok, Store} = set_cookie(Store3, URIB, <<"b2">>, <<"1">>, #{}),
+	{ok, CookiesA, _} = query(Store, URIA),
+	{ok, CookiesB, _} = query(Store, URIB),
+	2 = length(CookiesA),
+	2 = length(CookiesB),
+	ok.
+
+max_cookies_trailing_dot_same_quota_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	URIDot = #{scheme => <<"http">>, host => <<"example.org.">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{
+		max_cookies => infinity,
+		max_cookies_per_domain => 2
+	}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{ok, Store2} = set_cookie(Store1, URI, <<"b">>, <<"1">>, #{}),
+	{ok, Store} = set_cookie(Store2, URIDot, <<"c">>, <<"1">>, #{}),
+	{gun_cookies_list, #{cookies := All}} = Store,
+	2 = length(All),
+	ok.
+
+%% rfc6265bis: path comparison is not symmetric. A Secure cookie at
+%% /login does not block a non-secure cookie at / or /foo; it does
+%% block /login and /login/en.
+secure_cookie_nonsecure_broader_path_test() ->
+	SecureURI = #{scheme => <<"https">>, host => <<"example.org">>, path => <<"/login">>},
+	{ok, Store1} = set_cookie(gun_cookies_list:init(), SecureURI, <<"a">>, <<"1">>,
+		#{secure => true, path => <<"/login">>}),
+	InsecureURI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	{ok, _} = set_cookie(Store1, InsecureURI, <<"a">>, <<"2">>, #{path => <<"/">>}),
+	ok.
+
+secure_cookie_nonsecure_same_or_nested_path_test() ->
+	SecureURI = #{scheme => <<"https">>, host => <<"example.org">>, path => <<"/login">>},
+	{ok, Store1} = set_cookie(gun_cookies_list:init(), SecureURI, <<"a">>, <<"1">>,
+		#{secure => true, path => <<"/login">>}),
+	InsecureURI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/login">>},
+	{error, secure_cookie_matches} = set_cookie(Store1, InsecureURI, <<"a">>, <<"2">>,
+		#{path => <<"/login">>}),
+	{error, secure_cookie_matches} = set_cookie(Store1, InsecureURI#{path => <<"/login/en">>},
+		<<"a">>, <<"2">>, #{path => <<"/login/en">>}),
+	ok.
+
+set_cookie_trailing_dot_public_suffix_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.com.">>, path => <<"/">>},
+	{error, domain_is_public_suffix} = set_cookie(
+		gun_cookies_list:init(), URI, <<"a">>, <<"1">>, #{domain => <<"com.">>}),
+	ok.
+
+set_cookie_non_utf8_domain_attr_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	{error, domain_match_failed} = set_cookie(
+		gun_cookies_list:init(), URI, <<"a">>, <<"1">>, #{domain => <<128>>}),
+	ok.
+
+max_cookies_non_utf8_domain_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{max_cookies => 2}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{gun_cookies_list, State1=#{cookies := [Cookie]}} = Store1,
+	Store2 = {gun_cookies_list, State1#{cookies => [Cookie#{domain => <<128>>}, Cookie]}},
+	{ok, Store3} = set_cookie(Store2, URI, <<"b">>, <<"1">>, #{}),
+	{gun_cookies_list, State3} = Store3,
+	Store4 = {gun_cookies_list, State3#{cookies => [Cookie#{domain => <<128, ".com">>}]}},
+	{ok, _} = set_cookie(Store4, URI, <<"c">>, <<"1">>, #{}),
+	ok.
+
+max_cookies_gc_trims_excess_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Store0 = gun_cookies_list:init(#{max_cookies => 1}),
+	{ok, Store1} = set_cookie(Store0, URI, <<"a">>, <<"1">>, #{}),
+	{gun_cookies_list, State1=#{cookies := [Cookie]}} = Store1,
+	Store2 = {gun_cookies_list, State1#{cookies => [Cookie#{name => <<"x">>}, Cookie]}},
+	{ok, Store} = gc(Store2),
+	{ok, Cookies, _} = query(Store, URI),
+	1 = length(Cookies),
 	ok.
 
 %% Most of the tests for this module are converted from the
@@ -665,4 +1026,200 @@ wpt_secure_http_test() ->
 	ok.
 
 %% WPT: secure/set-from-ws* (Anything special required?)
+
+prefix_case_insensitive_test() ->
+	Https = #{scheme => <<"https">>, host => <<"example.org">>, path => <<"/">>},
+	{error, name_prefix_secure_requires_secure_only} = set_cookie(
+		gun_cookies_list:init(), Https, <<"__secure-foo">>, <<"bar">>, #{}),
+	{error, name_prefix_secure_requires_secure_only} = set_cookie(
+		gun_cookies_list:init(), Https, <<"__SeCuRe-foo">>, <<"bar">>, #{}),
+	{error, name_prefix_secure_requires_secure_only} = set_cookie(
+		gun_cookies_list:init(), Https, <<"__SEcure-foo">>, <<"bar">>, #{}),
+	{ok, StoreS} = set_cookie(gun_cookies_list:init(), Https,
+		<<"__sEcUrE-foo">>, <<"bar">>, #{secure => true}),
+	{ok, [#{name := <<"__sEcUrE-foo">>}], _} = query(StoreS, Https),
+	{error, name_prefix_host_requires_secure_only} = set_cookie(
+		gun_cookies_list:init(), Https, <<"__HOST-foo">>, <<"bar">>,
+		#{path => <<"/">>}),
+	{error, name_prefix_host_requires_host_only} = set_cookie(
+		gun_cookies_list:init(), Https, <<"__host-foo">>, <<"bar">>,
+		#{secure => true, path => <<"/">>, domain => <<"example.org">>}),
+	{error, name_prefix_host_requires_top_level_path} = set_cookie(
+		gun_cookies_list:init(), Https, <<"__HoSt-foo">>, <<"bar">>,
+		#{secure => true, path => <<"/cookies">>}),
+	{ok, StoreH} = set_cookie(gun_cookies_list:init(), Https,
+		<<"__HoSt-foo">>, <<"bar">>, #{secure => true, path => <<"/">>}),
+	{ok, [#{name := <<"__HoSt-foo">>}], _} = query(StoreH, Https),
+	%% A non-UTF-8 octet inside the prefix window must not crash.
+	%% __host- is 7 octets and __secure- is 9.
+	{ok, _} = set_cookie(gun_cookies_list:init(), Https,
+		<<255, 255, 255, 255, 255, 255, 255, 255, 255>>, <<"v">>, #{}),
+	{ok, _} = set_cookie(gun_cookies_list:init(), Https,
+		<<"__Ho", 255, "t-x">>, <<"v">>, #{secure => true, path => <<"/">>}),
+	Name = <<"__host", 16#C3, 16#A9>>,
+	{ok, StoreN} = set_cookie(gun_cookies_list:init(), Https,
+		Name, <<"1">>, #{}),
+	{ok, [#{name := Name}], _} = query(StoreN, Https),
+	ok.
+
+%% A nameless cookie whose value begins with a prefix is ignored.
+nameless_cookie_prefix_test() ->
+	URI = #{scheme => <<"https">>, host => <<"example.org">>, path => <<"/">>},
+	Reject = [
+		<<"__Secure-abc">>,
+		<<"__secure-abc=123">>,
+		<<"__SEcure-abc">>,
+		<<"__Host-abc">>,
+		<<"__HoSt-abc=123">>
+	],
+	[begin
+		{error, nameless_cookie_prefix} = set_cookie(
+			gun_cookies_list:init(), URI, <<>>, Value, #{secure => true})
+	end || Value <- Reject],
+	{ok, Store} = set_cookie(gun_cookies_list:init(), URI,
+		<<>>, <<"__Secure">>, #{}),
+	{ok, [#{name := <<>>, value := <<"__Secure">>}], _} = query(Store, URI),
+	ok.
+
+%% SameSite=None is stored only when the cookie is also Secure.
+samesite_none_requires_secure_test() ->
+	Https = #{scheme => <<"https">>, host => <<"example.org">>, path => <<"/">>},
+	Http = Https#{scheme := <<"http">>},
+	{error, samesite_none_requires_secure} = set_cookie(
+		gun_cookies_list:init(), Https, <<"a">>, <<"b">>, #{same_site => none}),
+	{error, samesite_none_requires_secure} = set_cookie(
+		gun_cookies_list:init(), Http, <<"a">>, <<"b">>, #{same_site => none}),
+	{ok, _} = set_cookie(gun_cookies_list:init(), Https, <<"a">>, <<"b">>,
+		#{same_site => none, secure => true}),
+	%% Secure is rejected first on an insecure request.
+	{error, secure_scheme_only} = set_cookie(gun_cookies_list:init(), Http,
+		<<"a">>, <<"b">>, #{same_site => none, secure => true}),
+	{ok, Store} = set_cookie(gun_cookies_list:init(), Http, <<"a">>, <<"b">>,
+		#{same_site => lax}),
+	{ok, [#{same_site := lax}], _} = query(Store, Http),
+	ok.
+
+%% Expired cookies are removed when the store is queried.
+query_drops_expired_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Now = erlang:universaltime(),
+	Past = {{2020, 1, 1}, {0, 0, 0}},
+	{gun_cookies_list, State0} = gun_cookies_list:init(),
+	Base = #{
+		name => <<"live">>,
+		value => <<"1">>,
+		domain => <<"example.org">>,
+		path => <<"/">>,
+		creation_time => Now,
+		last_access_time => Now,
+		expiry_time => infinity,
+		persistent => false,
+		host_only => true,
+		secure_only => false,
+		http_only => false,
+		same_site => default
+	},
+	Expired = Base#{name => <<"exp">>, expiry_time => Past, persistent => true},
+	EqualNow = Base#{name => <<"now">>, expiry_time => Now, persistent => true},
+	Store0 = {gun_cookies_list, State0#{cookies => [Expired, EqualNow, Base]}},
+	{ok, Cookies, Store} = gun_cookies:query(Store0, URI),
+	[<<"live">>] = [N || #{name := N} <- Cookies],
+	{gun_cookies_list, #{cookies := Left}} = Store,
+	[<<"live">>] = [N || #{name := N} <- Left],
+	ok.
+
+%% A cookie cookie/1 cannot serialize is omitted from the header
+%% and removed from the jar. The other cookies are still sent.
+query_drops_unsendable_test() ->
+	URI = #{scheme => <<"http">>, host => <<"example.org">>, path => <<"/">>},
+	Now = erlang:universaltime(),
+	{gun_cookies_list, State0} = gun_cookies_list:init(),
+	Base = #{
+		domain => <<"example.org">>,
+		path => <<"/">>,
+		creation_time => Now,
+		last_access_time => Now,
+		expiry_time => infinity,
+		persistent => false,
+		host_only => true,
+		secure_only => false,
+		http_only => false,
+		same_site => default
+	},
+	Good = [
+		Base#{name => <<"good">>, value => <<"yes">>},
+		Base#{name => <<"a b">>, value => <<"c,d">>},
+		Base#{name => <<"tab">>, value => <<"a\tb">>},
+		Base#{name => <<"high">>, value => <<128>>},
+		Base#{name => <<"keep">>, value => <<"1">>, domain => <<"other.example">>}
+	],
+	Bad = [
+		Base#{name => <<"crlf">>, value => <<"b\r\nX: y">>},
+		Base#{name => <<"lf">>, value => <<"b\n">>},
+		Base#{name => <<"nul">>, value => <<0>>},
+		Base#{name => <<"del">>, value => <<127>>},
+		Base#{name => <<"semi">>, value => <<"a;b">>},
+		Base#{name => <<"a=b">>, value => <<"c">>},
+		Base#{name => <<"away">>, value => <<1>>, domain => <<"other.example">>}
+	],
+	Store0 = {gun_cookies_list, State0#{cookies => Good ++ Bad}},
+	{Headers, Store1} = add_cookie_header(<<"http">>, <<"example.org">>, <<"/">>,
+		[{<<"accept">>, <<"*/*">>}], Store0),
+	[{<<"accept">>, <<"*/*">>}, {<<"cookie">>, Cookie}] = Headers,
+	Bin = iolist_to_binary(Cookie),
+	nomatch = binary:match(Bin, <<"crlf">>),
+	nomatch = binary:match(Bin, <<"\r">>),
+	nomatch = binary:match(Bin, <<"\n">>),
+	nomatch = binary:match(Bin, <<";b">>),
+	nomatch = binary:match(Bin, <<"a=b=">>),
+	{_, _} = binary:match(Bin, <<"good=yes">>),
+	{_, _} = binary:match(Bin, <<"a b=c,d">>),
+	{_, _} = binary:match(Bin, <<"tab=a\tb">>),
+	{_, _} = binary:match(Bin, <<"high=", 128>>),
+	[<<"a b">>, <<"good">>, <<"high">>, <<"keep">>, <<"tab">>] =
+		lists:sort([N || #{name := N} <- cookies_of(Store1)]),
+	%% Nothing sendable: no Cookie header, and the bad cookies are gone.
+	StoreBad = {gun_cookies_list, State0#{cookies => Bad}},
+	{[{<<"accept">>, <<"*/*">>}], Store2} = add_cookie_header(
+		<<"http">>, <<"example.org">>, <<"/">>,
+		[{<<"accept">>, <<"*/*">>}], StoreBad),
+	[] = cookies_of(Store2),
+	%% gc removes them without a request.
+	{ok, Store3} = gc(Store0),
+	[<<"a b">>, <<"good">>, <<"high">>, <<"keep">>, <<"tab">>] =
+		lists:sort([N || #{name := N} <- cookies_of(Store3)]),
+	%% A later insert drops bad cookies already in the jar.
+	{ok, Store4} = set_cookie(StoreBad, URI, <<"new">>, <<"1">>, #{}),
+	[<<"new">>] = lists:sort([N || #{name := N} <- cookies_of(Store4)]),
+	%% An unsendable insert does not take a slot or evict a good cookie.
+	{ok, Store5} = set_cookie(Store4, URI, <<"nope">>, <<"a;b">>, #{}),
+	[<<"new">>] = lists:sort([N || #{name := N} <- cookies_of(Store5)]),
+	Init = gun_cookies_list:init(#{max_cookies => 1, max_cookies_per_domain => 1}),
+	{ok, Full} = set_cookie(Init, URI, <<"a">>, <<"1">>, #{}),
+	{ok, Full2} = set_cookie(Full, URI, <<"b">>, <<"x;y">>, #{}),
+	[<<"a">>] = lists:sort([N || #{name := N} <- cookies_of(Full2)]),
+	{[{<<"cookie">>, Cookie1}], _} = add_cookie_header(
+		<<"http">>, <<"example.org">>, <<"/">>, [], Full2),
+	<<"a=1">> = iolist_to_binary(Cookie1),
+	%% Replacing a stored cookie with a value cookie/1 rejects keeps the old one.
+	{ok, Repl} = set_cookie(Full, URI, <<"a">>, <<"x;y">>, #{}),
+	[#{name := <<"a">>, value := <<"1">>}] = cookies_of(Repl),
+	{ok, Two} = set_cookie(gun_cookies_list:init(), URI, <<"a">>, <<"1">>, #{}),
+	{ok, Two1} = set_cookie(Two, URI, <<"b">>, <<"2">>, #{}),
+	{[{<<"cookie">>, Cookie2}], _} = add_cookie_header(
+		<<"http">>, <<"example.org">>, <<"/">>, [], Two1),
+	<<"a=1; b=2">> = iolist_to_binary(Cookie2),
+	{ok, Two2} = set_cookie(Two1, URI, <<"a">>, <<"x;y">>, #{}),
+	[<<"a">>, <<"b">>] = lists:sort([N || #{name := N} <- cookies_of(Two2)]),
+	[<<"1">>] = [V || #{name := <<"a">>, value := V} <- cookies_of(Two2)],
+	%% A past expiry still deletes, including when the value cannot be sent.
+	Past = {{2020, 1, 1}, {0, 0, 0}},
+	{ok, Gone} = set_cookie(Full, URI, <<"a">>, <<"x;y">>, #{max_age => Past}),
+	[] = cookies_of(Gone),
+	{ok, Gone2} = set_cookie(Two1, URI, <<"a">>, <<"1">>, #{max_age => Past}),
+	[<<"b">>] = [N || #{name := N} <- cookies_of(Gone2)],
+	ok.
+
+cookies_of({gun_cookies_list, #{cookies := Cookies}}) ->
+	Cookies.
 -endif.

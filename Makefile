@@ -2,7 +2,7 @@
 
 PROJECT = whatnot_gun
 PROJECT_DESCRIPTION = HTTP/1.1, HTTP/2 and Websocket client for Erlang/OTP.
-PROJECT_VERSION = 2.4.7
+PROJECT_VERSION = 2.8.0
 
 # The OTP application is renamed to whatnot_gun for the Whatnot fork, but the
 # modules, application callback, and supervisor keep their upstream `gun_*`
@@ -23,7 +23,7 @@ CT_OPTS += -ct_hooks gun_ct_hook [] # -boot start_sasl
 LOCAL_DEPS = public_key ssl
 
 DEPS = cowlib
-dep_cowlib = git https://github.com/ninenines/cowlib 2.17.0
+dep_cowlib = git https://github.com/ninenines/cowlib 2.22.0
 
 ifeq ($(GUN_QUICER),1)
 DEPS += quicer
@@ -32,34 +32,33 @@ endif
 
 DOC_DEPS = asciideck
 
-TEST_DEPS = $(if $(CI_ERLANG_MK),ci.erlang.mk) ct_helper cowboy ranch jsx
+TEST_DEPS = $(if $(CI_ERLANG_MK),ci.erlang.mk) ct_helper cowboy ranch
 dep_ct_helper = git https://github.com/ninenines/ct_helper.git master
 dep_cowboy_commit = 2.9.0
 dep_ranch_commit = 2.0.0
-dep_jsx = git https://github.com/talentdeficit/jsx v3.1.0
 
 # CI configuration.
 
 dep_ci.erlang.mk = git https://github.com/ninenines/ci.erlang.mk master
 DEP_EARLY_PLUGINS = ci.erlang.mk
 
-AUTO_CI_OTP ?= OTP-LATEST-24+
-AUTO_CI_WINDOWS ?= OTP-LATEST-24+
+AUTO_CI_OTP ?= OTP-LATEST-27+
+AUTO_CI_WINDOWS ?= OTP-LATEST-27+
 
 # Hex configuration.
 define HEX_TARBALL_EXTRA_METADATA
 #{
 	licenses => [<<"ISC">>],
 	links => #{
-		<<"Function reference">> => <<"https://ninenines.eu/docs/en/gun/2.4/manual/">>,
-		<<"User guide">> => <<"https://ninenines.eu/docs/en/gun/2.4/guide/">>,
+		<<"Function reference">> => <<"https://ninenines.eu/docs/en/gun/2.8/manual/">>,
+		<<"User guide">> => <<"https://ninenines.eu/docs/en/gun/2.8/guide/">>,
 		<<"GitHub">> => <<"https://github.com/ninenines/gun">>,
 		<<"Sponsor">> => <<"https://github.com/sponsors/essen">>
 	}
 }
 endef
 
-hex_req_cowlib = >= 2.15.0 and < 3.0.0
+hex_req_cowlib = >= 2.22.0 and < 3.0.0
 
 # Standard targets.
 
@@ -150,14 +149,6 @@ gen: gen-idna | $(ERLANG_MK_TMP)
 	$(gen_verbose) wget -qO - $(GEN_URL) > $(GEN_DAT)
 	$(gen_verbose) $(call erlang,$(call gen.erl))
 
-# Automatically update the http-state files in test/wpt/cookies.
-
-update-cookie-tests:
-	$(verbose) rm -rf $(ERLANG_MK_TMP)/wpt
-	$(verbose) rm -f test/wpt/cookies/*
-	$(verbose) git clone https://github.com/web-platform-tests/wpt $(ERLANG_MK_TMP)/wpt
-	$(verbose) cp $(ERLANG_MK_TMP)/wpt/cookies/http-state/resources/test-files/* test/wpt/cookies/
-
 # Prepare for the release.
 
 prepare_tag:
@@ -186,6 +177,7 @@ prepare_tag:
 	$(verbose) echo "Dependencies:"
 	$(verbose) grep ^DEPS Makefile || echo "DEPS ="
 	$(verbose) grep ^dep_ Makefile || true
+	$(verbose) grep ^hex_req_ Makefile || true
 	$(verbose) echo
 	$(verbose) echo "rebar.config:"
 	$(verbose) cat rebar.config || true

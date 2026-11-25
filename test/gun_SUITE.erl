@@ -57,6 +57,20 @@ groups() ->
 
 %% Tests.
 
+alpn_negotiation_failed_no_crash(_) ->
+	doc("A peer selecting an ALPN protocol that was never advertised "
+		"must not crash the caller. (RFC 7301)"),
+	{ok, http2} = gun_protocols:negotiated({ok, <<"h2">>}, [http2, http]),
+	{ok, http} = gun_protocols:negotiated({ok, <<"http/1.1">>}, [http2, http]),
+	{error, {alpn_negotiation_failed, <<"h2">>}} =
+		gun_protocols:negotiated({ok, <<"h2">>}, [http]),
+	{error, {alpn_negotiation_failed, <<"http/1.1">>}} =
+		gun_protocols:negotiated({ok, <<"http/1.1">>}, [http2]),
+	{ok, http2} = gun_protocols:negotiated({error, protocol_not_negotiated}, [http2]),
+	{ok, http} = gun_protocols:negotiated({error, protocol_not_negotiated}, [http2, http]),
+	{error, {alpn_negotiation_failed, <<"h2c">>}} =
+		gun_protocols:negotiated({ok, <<"h2c">>}, [http2, http]).
+
 atom_header_name(_) ->
 	doc("Header names may be given as atom."),
 	{ok, OriginPid, OriginPort} = init_origin(tcp, http),
@@ -235,6 +249,26 @@ invalid_request_headers_raise_headers(_) ->
 	end,
 	gun:close(Pid).
 
+invalid_content_length_raise(_) ->
+	doc("An unparseable content-length raises in the caller "
+		"before the request is sent to the connection. "
+		"invalid_request_headers => ignore skips that check."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	%% The connection will not succeed, but we don't need it to.
+	try
+		gun:headers(Pid, "POST", "/", [
+			{<<"content-length">>, <<"not-a-number">>}
+		]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, <<"content-length">>, _} -> ok
+	end,
+	StreamRef = gun:headers(Pid, "POST", "/", [
+		{<<"content-length">>, <<"not-a-number">>}
+	], #{invalid_request_headers => ignore}),
+	true = is_reference(StreamRef),
+	gun:close(Pid).
+
 invalid_request_headers_raise_request(_) ->
 	doc("Ensure invalid request headers raise an exception."),
 	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
@@ -259,6 +293,152 @@ invalid_request_headers_raise_ws_upgrade(_) ->
 		error:{invalid_request_header, _, _} -> ok
 	end,
 	gun:close(Pid).
+
+invalid_request_headers_raise_name(_) ->
+	doc("Ensure a request header with a CRLF in its name raises an "
+		"exception, the same way a CRLF in its value already does."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/", [{<<"x-test\r\nInjected">>, <<"value">>}]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, _, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_ignore(_) ->
+	doc("Ensure an invalid request path is sent when allowed by configuration."),
+	{ok, ListenSocket} = gen_tcp:listen(0, [binary, {active, false}]),
+	{ok, {_, Port}} = inet:sockname(ListenSocket),
+	{ok, Pid} = gun:open("localhost", Port, #{protocols => [http]}),
+	{ok, ClientSocket} = gen_tcp:accept(ListenSocket, 5000),
+	{ok, http} = gun:await_up(Pid),
+	_ = gun:get(Pid, "/x\r\nX-Injected: 1", [], #{
+		invalid_request_headers => ignore
+	}),
+	{ok, Data} = gen_tcp:recv(ClientSocket, 0, 5000),
+	true = binary:match(Data, <<"X-Injected: 1">>) =/= nomatch,
+	gun:close(Pid).
+
+invalid_request_line_raise_path(_) ->
+	doc("Ensure an invalid request path raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/search?q=x\r\nX-Injected: 1", []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, path, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_method(_) ->
+	doc("Ensure an invalid request method raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:request(Pid, <<"GET\r\nX-Injected: 1">>, "/", [], <<>>),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, method, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_ws_upgrade(_) ->
+	doc("Ensure an invalid Websocket upgrade path raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:ws_upgrade(Pid, "/ws\r\nX-Injected: 1", []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, path, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_connect(_) ->
+	doc("Ensure an invalid CONNECT destination host raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:connect(Pid, #{host => "localhost\r\nX-Injected: 1", port => 1234}, []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, host, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_headers_raise_nul_value(_) ->
+	doc("Ensure a NUL byte in a request header value raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/", [{<<"x-test">>, <<"bad", 0, "value">>}]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, _, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_headers_raise_nul_name(_) ->
+	doc("Ensure a NUL byte in a request header name raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/", [{<<"x-test", 0, "Injected">>, <<"value">>}]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, _, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_path_nul(_) ->
+	doc("Ensure a NUL byte in the request path raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, <<"/search", 0, "q=1">>, []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, path, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_method_nul(_) ->
+	doc("Ensure a NUL byte in the request method raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:request(Pid, <<"GET", 0>>, "/", [], <<>>),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, method, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_connect_nul(_) ->
+	doc("Ensure a NUL byte in the CONNECT destination host raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:connect(Pid, #{host => <<"localhost", 0>>, port => 1234}, []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, host, _} -> ok
+	end,
+	gun:close(Pid).
+
+iodata_request_content_length(_) ->
+	doc("A content-length request header given as an iolist is accepted."),
+	{ok, OriginPid, OriginPort} = init_origin(tcp, http,
+		fun(Parent, _, ClientSocket, ClientTransport) ->
+			{ok, Data} = ClientTransport:recv(ClientSocket, 0, 1000),
+			Parent ! {self(), Data}
+		end),
+	{ok, ConnPid} = gun:open("localhost", OriginPort),
+	{ok, http} = gun:await_up(ConnPid),
+	_ = gun:headers(ConnPid, "POST", "/", [
+		{<<"content-length">>, "5"}
+	]),
+	Data = receive
+		{OriginPid, Bin} when is_binary(Bin) ->
+			Bin
+	after 5000 ->
+		error(timeout)
+	end,
+	{_, _} = binary:match(Data, <<"content-length: 5">>),
+	gun:close(ConnPid).
 
 keepalive_infinity(_) ->
 	doc("Ensure infinity for keepalive is accepted by all protocols."),
@@ -356,6 +536,207 @@ max_header_block_size(_) ->
 				{error, {connection_error, limit_reached, _}}, _} ->
 			gun:close(ConnPid)
 	end.
+
+max_header_list_size(_) ->
+	doc("The max_header_list_size HTTP/2 option resets the stream "
+	    "when a response header list is larger than the limit. "
+	    "The connection stays usable."),
+	{ok, OriginPid, Port} = init_origin(tcp, http2, fun(_, _, Socket, Transport) ->
+		%% :status and nine 4000-byte user-agents exceed 32768.
+		Value = binary:copy(<<$a>>, 4000),
+		{Big, _} = cow_hpack:encode([
+			{<<":status">>, <<"200">>}
+			|lists:duplicate(9, {<<"user-agent">>, Value})
+		], cow_hpack:init(), #{huffman => false}),
+		{Status, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
+		{ok, <<Len:24, 1:8, _:8, StreamID:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len, 1000),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID, fin, Big)),
+		{ok, <<4:24, 3:8, 0:8, StreamID:32, _:32>>}
+			= Transport:recv(Socket, 13, 1000),
+		{ok, <<Len2:24, 1:8, _:8, StreamID2:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len2, 1000),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID2, fin, Status)),
+		timer:sleep(1000)
+	end),
+	{ok, ConnPid} = gun:open("localhost", Port, #{
+		transport => tcp,
+		protocols => [http2]
+	}),
+	{ok, http2} = gun:await_up(ConnPid),
+	handshake_completed = receive_from(OriginPid),
+	StreamRef = gun:get(ConnPid, "/"),
+	{error, {stream_error, {stream_error, enhance_your_calm, _}}}
+		= gun:await(ConnPid, StreamRef),
+	StreamRef2 = gun:get(ConnPid, "/"),
+	{response, fin, 200, _} = gun:await(ConnPid, StreamRef2),
+	gun:close(ConnPid).
+
+max_header_list_size_infinity(_) ->
+	doc("The max_header_list_size HTTP/2 option set to infinity disables the limit."),
+	{ok, OriginPid, Port} = init_origin(tcp, http2, fun(_, _, Socket, Transport) ->
+		%% :status and nine 4000-byte user-agents exceed 32768.
+		Value = binary:copy(<<$a>>, 4000),
+		{Big, _} = cow_hpack:encode([
+			{<<":status">>, <<"200">>}
+			|lists:duplicate(9, {<<"user-agent">>, Value})
+		], cow_hpack:init(), #{huffman => false}),
+		{ok, <<Len:24, 1:8, _:8, StreamID:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len, 1000),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID, fin, Big)),
+		timer:sleep(1000)
+	end),
+	{ok, ConnPid} = gun:open("localhost", Port, #{
+		transport => tcp,
+		protocols => [http2],
+		http2_opts => #{max_header_list_size => infinity}
+	}),
+	{ok, http2} = gun:await_up(ConnPid),
+	handshake_completed = receive_from(OriginPid),
+	StreamRef = gun:get(ConnPid, "/"),
+	{response, fin, 200, _} = gun:await(ConnPid, StreamRef),
+	gun:close(ConnPid).
+
+max_header_list_size_trailers(_) ->
+	doc("The max_header_list_size HTTP/2 option resets the stream "
+	    "when trailers are larger than the limit. Later DATA on that "
+	    "stream is ignored and the connection stays usable."),
+	{ok, OriginPid, Port} = init_origin(tcp, http2, fun(_, _, Socket, Transport) ->
+		%% :status and nine 4000-byte user-agents exceed 32768.
+		Value = binary:copy(<<$a>>, 4000),
+		{Status, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
+		{Big, _} = cow_hpack:encode([
+			{<<":status">>, <<"200">>}
+			|lists:duplicate(9, {<<"user-agent">>, Value})
+		], cow_hpack:init(), #{huffman => false}),
+		{ok, <<Len:24, 1:8, _:8, StreamID:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len, 1000),
+		ok = Transport:send(Socket, [
+			cow_http2:headers(StreamID, nofin, Status),
+			cow_http2:data(StreamID, nofin, <<"body">>),
+			cow_http2:headers(StreamID, fin, Big),
+			cow_http2:data(StreamID, fin, <<"late">>)
+		]),
+		{ok, <<4:24, 3:8, 0:8, StreamID:32, _:32>>}
+			= Transport:recv(Socket, 13, 1000),
+		{ok, <<Len2:24, 1:8, _:8, StreamID2:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len2, 1000),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID2, fin, Status)),
+		timer:sleep(1000)
+	end),
+	{ok, ConnPid} = gun:open("localhost", Port, #{
+		transport => tcp,
+		protocols => [http2]
+	}),
+	{ok, http2} = gun:await_up(ConnPid),
+	handshake_completed = receive_from(OriginPid),
+	StreamRef = gun:get(ConnPid, "/"),
+	{response, nofin, 200, _} = gun:await(ConnPid, StreamRef),
+	{data, nofin, <<"body">>} = gun:await(ConnPid, StreamRef),
+	{error, {stream_error, {stream_error, enhance_your_calm, _}}}
+		= gun:await(ConnPid, StreamRef),
+	{error, timeout} = gun:await(ConnPid, StreamRef, 500),
+	StreamRef2 = gun:get(ConnPid, "/"),
+	{response, fin, 200, _} = gun:await(ConnPid, StreamRef2),
+	gun:close(ConnPid).
+
+max_header_list_size_push(_) ->
+	doc("The max_header_list_size HTTP/2 option rejects an oversized "
+	    "PUSH_PROMISE. No gun_push is produced and the parent response "
+	    "completes."),
+	{ok, OriginPid, Port} = init_origin(tcp, http2, fun(_, _, Socket, Transport) ->
+		{ok, <<Len:24, 1:8, _:8, StreamID:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, ReqBlock} = Transport:recv(Socket, Len, 1000),
+		%% Scheme and authority must match the request. A mismatch is
+		%% rejected by Gun, so the test would pass with no size check.
+		{ReqHeaders, _} = cow_hpack:decode(ReqBlock),
+		{_, Scheme} = lists:keyfind(<<":scheme">>, 1, ReqHeaders),
+		{_, Authority} = lists:keyfind(<<":authority">>, 1, ReqHeaders),
+		Value = binary:copy(<<$a>>, 4000),
+		{Promise, _} = cow_hpack:encode([
+			{<<":method">>, <<"GET">>},
+			{<<":scheme">>, Scheme},
+			{<<":authority">>, Authority},
+			{<<":path">>, <<"/">>}
+			|lists:duplicate(9, {<<"user-agent">>, Value})
+		], cow_hpack:init(), #{huffman => false}),
+		{Status, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
+		ok = Transport:send(Socket, cow_http2:push_promise(StreamID, 2, Promise)),
+		%% ENHANCE_YOUR_CALM on the promised id. The connection stays up.
+		{ok, <<4:24, 3:8, 0:8, 2:32, 11:32>>}
+			= Transport:recv(Socket, 13, 1000),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID, fin, Status)),
+		timer:sleep(1000)
+	end),
+	{ok, ConnPid} = gun:open("localhost", Port, #{
+		transport => tcp,
+		protocols => [http2]
+	}),
+	{ok, http2} = gun:await_up(ConnPid),
+	handshake_completed = receive_from(OriginPid),
+	StreamRef = gun:get(ConnPid, "/"),
+	{response, fin, 200, _} = gun:await(ConnPid, StreamRef),
+	receive
+		{gun_push, ConnPid, _, _, _, _, _} ->
+			error(unexpected_push)
+	after 0 ->
+		ok
+	end,
+	gun:close(ConnPid).
+
+%% :status 200 is 42 octets. An empty user-agent adds 42.
+max_header_list_size_bounds(_) ->
+	doc("The max_header_list_size HTTP/2 option accepts a header list "
+	    "of that many octets and rejects one more."),
+	{ok, OriginPid, Port} = init_origin(tcp, http2, fun(_, _, Socket, Transport) ->
+		{ok, <<Len:24, 1:8, _:8, StreamID:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len, 1000),
+		{Exact, _} = cow_hpack:encode([
+			{<<":status">>, <<"200">>},
+			{<<"user-agent">>, <<>>}
+		], cow_hpack:init(), #{huffman => false}),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID, fin,
+			iolist_to_binary(Exact))),
+		{ok, <<Len2:24, 1:8, _:8, StreamID2:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len2, 1000),
+		{Over, _} = cow_hpack:encode([
+			{<<":status">>, <<"200">>},
+			{<<"user-agent">>, <<$a>>}
+		], cow_hpack:init(), #{huffman => false}),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID2, fin,
+			iolist_to_binary(Over))),
+		{ok, <<4:24, 3:8, 0:8, StreamID2:32, _:32>>}
+			= Transport:recv(Socket, 13, 1000),
+		{ok, <<Len3:24, 1:8, _:8, StreamID3:32>>}
+			= Transport:recv(Socket, 9, 1000),
+		{ok, _} = Transport:recv(Socket, Len3, 1000),
+		{Status, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
+		ok = Transport:send(Socket, cow_http2:headers(StreamID3, fin, Status)),
+		timer:sleep(1000)
+	end),
+	{ok, ConnPid} = gun:open("localhost", Port, #{
+		transport => tcp,
+		protocols => [http2],
+		http2_opts => #{max_header_list_size => 84}
+	}),
+	{ok, http2} = gun:await_up(ConnPid),
+	handshake_completed = receive_from(OriginPid),
+	StreamRef1 = gun:get(ConnPid, "/"),
+	{response, fin, 200, _} = gun:await(ConnPid, StreamRef1),
+	StreamRef2 = gun:get(ConnPid, "/"),
+	{error, {stream_error, {stream_error, enhance_your_calm, _}}}
+		= gun:await(ConnPid, StreamRef2),
+	StreamRef3 = gun:get(ConnPid, "/"),
+	{response, fin, 200, _} = gun:await(ConnPid, StreamRef3),
+	gun:close(ConnPid).
 
 max_trailer_block_size(_) ->
 	doc("The max_trailer_block_size HTTP/1.1 option limits the size of data "
@@ -681,6 +1062,34 @@ set_owner(_) ->
 	#{owner := Self} = gun:info(ConnPid),
 	gun:close(ConnPid).
 
+set_owner_after_shutdown_no_crash(_) ->
+	doc("set_owner during shutdown must reply with an error "
+		"instead of crashing the connection."),
+	{ok, _, OriginPort} = init_origin(tcp, http,
+		fun(_, _, _, _) -> timer:sleep(5000) end),
+	{ok, ConnPid} = gun:open("localhost", OriginPort, #{
+		http_opts => #{closing_timeout => 5000}
+	}),
+	{ok, http} = gun:await_up(ConnPid),
+	_ = gun:get(ConnPid, "/"),
+	MRef = monitor(process, ConnPid),
+	ok = gun:shutdown(ConnPid),
+	gun:set_owner(ConnPid, self()),
+	receive
+		{gun_error, ConnPid, {badstate, _}} ->
+			ok
+	after 5000 ->
+		error(timeout)
+	end,
+	receive
+		{'DOWN', MRef, process, ConnPid, Reason} ->
+			error({unexpected_crash, Reason})
+	after 500 ->
+		ok
+	end,
+	demonitor(MRef, [flush]),
+	gun:close(ConnPid).
+
 shutdown_reason(_) ->
 	doc("The last connection failure must be propagated."),
 	do_shutdown_reason().
@@ -761,6 +1170,7 @@ stream_info_http2(_) ->
 	}),
 	{ok, http2} = gun:await_up(Pid),
 	handshake_completed = receive_from(OriginPid),
+	{ok, undefined} = gun:stream_info(Pid, undefined),
 	{ok, undefined} = gun:stream_info(Pid, make_ref()),
 	StreamRef = gun:get(Pid, "/"),
 	Self = self(),
@@ -785,16 +1195,18 @@ supervise_false(_) ->
 	ok.
 
 tls13_post_handshake_alert_http1(_) ->
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
-			do_tls13_post_handshake_alert_http1();
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
+	case os:type() of
+		{unix, linux} ->
+			do_tls13_post_handshake_alert_http1(10);
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
 
-do_tls13_post_handshake_alert_http1() ->
+%% The server closes the connection right after sending the alert,
+%% before reading the data we sent. The kernel then resets the
+%% connection and the alert may be discarded before we can read it,
+%% resulting in {error,closed} or {error,einval}. We retry in that case.
+do_tls13_post_handshake_alert_http1(Attempts) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when using HTTP/1.1 in mTLS scenarios."),
 	TestOpts = ct_helper:get_certs_from_ets(),
@@ -824,6 +1236,9 @@ do_tls13_post_handshake_alert_http1() ->
 			{verify, verify_none}
 		]
 	}),
+	%% We monitor early so that the down reason is not lost
+	%% to a noproc if the connection process exits too soon.
+	MRef = monitor(process, ConnPid),
 	%% We want to send data immediately as soon as the connection is up.
 	%% So we do it before we receive the gun_up message.
 	StreamRef = gun:post(ConnPid, "/", [{<<"content-type">>, <<"application/octet-stream">>}]),
@@ -833,19 +1248,22 @@ do_tls13_post_handshake_alert_http1() ->
 	end || _ <- lists:seq(1, 100)],
 	%% The alert will occur after the gun_up message has been sent
 	%% in the case of HTTP/1.1 (when active mode gets enabled).
-	{ok, http} = gun:await_up(ConnPid),
-	%% A busy CI runner can delay delivery of the post-handshake alert
-	%% well past the default 5s, so we allow more time here.
-	{error, {down, {shutdown,
-		{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, 15000),
-	gun:close(ConnPid).
+	{ok, http} = gun:await_up(ConnPid, MRef),
+	Result = gun:await(ConnPid, undefined, MRef),
+	gun:close(ConnPid),
+	case Result of
+		{error, {down, {shutdown, {tls_alert, {certificate_required, _}}}}} ->
+			ok;
+		{error, {down, {shutdown, {error, Reason}}}}
+				when Attempts > 1, (Reason =:= closed orelse Reason =:= einval) ->
+			ct:log("Connection reset before the TLS alert was received, retrying."),
+			do_tls13_post_handshake_alert_http1(Attempts - 1)
+	end.
 
 tls13_post_handshake_alert_http2(_) ->
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_http2();
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -882,14 +1300,13 @@ do_tls13_post_handshake_alert_http2() ->
 			{verify, verify_none}
 		]
 	}),
-	case gun:await_up(ConnPid) of
+	MRef = monitor(process, ConnPid),
+	case gun:await_up(ConnPid, MRef) of
 		{error, {down, {shutdown, {tls_alert, {certificate_required, _}}}}} ->
 			ct:log("TLS alert received in gun:await_up");
 		{ok, http2} ->
-			%% A busy CI runner can delay delivery of the post-handshake alert
-			%% well past the default 5s, so we allow more time here.
 			{error, {down, {shutdown,
-				{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, 15000),
+				{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, MRef),
 			ct:log("TLS alert received after gun:await_up")
 	end,
 	gun:close(ConnPid).
@@ -898,11 +1315,9 @@ tls13_post_handshake_alert_http1_via_http(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/1.1 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(http, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -911,11 +1326,9 @@ tls13_post_handshake_alert_http2_via_http(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/1.1 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(http, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -924,11 +1337,9 @@ tls13_post_handshake_alert_http1_via_https(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/1.1 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(https, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -937,11 +1348,9 @@ tls13_post_handshake_alert_http2_via_https(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/1.1 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(https, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -950,11 +1359,9 @@ tls13_post_handshake_alert_http1_via_h2c(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/2 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2c, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -963,11 +1370,9 @@ tls13_post_handshake_alert_http2_via_h2c(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/2 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2c, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -976,11 +1381,9 @@ tls13_post_handshake_alert_http1_via_h2(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/2 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -989,16 +1392,18 @@ tls13_post_handshake_alert_http2_via_h2(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/2 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
 
 do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol) ->
+	do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol, 10).
+
+%% See do_tls13_post_handshake_alert_http1/1 for why we may retry.
+do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol, Attempts) ->
 	TestOpts = ct_helper:get_certs_from_ets(),
 	ExtraOpts = case OriginProtocol of
 		http -> [];
@@ -1031,7 +1436,8 @@ do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol) ->
 		protocols => [ProxyProtocol]
 		%,trace => true
 	}),
-	{ok, ProxyProtocol} = gun:await_up(ConnPid),
+	MRef = monitor(process, ConnPid),
+	{ok, ProxyProtocol} = gun:await_up(ConnPid, MRef),
 	tunnel_SUITE:do_handshake_completed(ProxyProtocol, ProxyPid),
 	TunnelStreamRef = gun:connect(ConnPid, #{
 		host => "localhost",
@@ -1042,12 +1448,12 @@ do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol) ->
 			{verify, verify_none}
 		]
 	}),
-	{response, fin, 200, _} = gun:await(ConnPid, TunnelStreamRef),
+	{response, fin, 200, _} = gun:await(ConnPid, TunnelStreamRef, MRef),
 	%% When going through an HTTP/2 tunnel we must wait for the protocol
 	%% to be up before sending data.
 	Continue = case ProxyProtocol of
 		http2 ->
-			case gun:await(ConnPid, TunnelStreamRef) of
+			case gun:await(ConnPid, TunnelStreamRef, MRef) of
 				{up, OriginProtocol} ->
 					ok;
 				{error, {stream_error, {stream_error,
@@ -1057,7 +1463,7 @@ do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol) ->
 		http ->
 			ok
 	end,
-	case Continue of
+	Result = case Continue of
 		stop ->
 			ok;
 		ok ->
@@ -1073,25 +1479,36 @@ do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol) ->
 				http2 ->
 					%% We already received the gun_tunnel_up at this point for HTTP/2.
 					{error, {stream_error, {stream_error,
-						{tls_alert, {certificate_required, _}}, _}}} = gun:await(ConnPid, TunnelStreamRef);
+						{tls_alert, {certificate_required, _}}, _}}} = gun:await(ConnPid, TunnelStreamRef, MRef);
 				http ->
 					%% The alert will occur after the gun_up message has been sent
 					%% in the case of HTTP/1.1 (when active mode gets enabled).
 					%% But when we are using TLS over TLS the timing is a little
 					%% different and we may get a failure before receiving gun_tunnel_up.
-					case gun:await(ConnPid, TunnelStreamRef) of
+					case gun:await(ConnPid, TunnelStreamRef, MRef) of
 						{up, OriginProtocol} ->
-							%% A busy CI runner can delay delivery of the post-handshake
-							%% alert well past the default 5s, so we allow more time here.
-							{error, {down, {shutdown,
-								{tls_alert, {certificate_required, _}}}}} = gun:await(ConnPid, undefined, 15000);
+							case gun:await(ConnPid, undefined, MRef) of
+								{error, {down, {shutdown,
+										{tls_alert, {certificate_required, _}}}}} ->
+									ok;
+								{error, {down, {shutdown, {error, Reason}}}}
+										when Attempts > 1, (Reason =:= closed orelse Reason =:= einval) ->
+									retry
+							end;
 						{error, {stream_error, {closed,
 								{tls_alert, {certificate_required, _}}}}} ->
 							ok
 					end
 			end
 	end,
-	gun:close(ConnPid).
+	gun:close(ConnPid),
+	case Result of
+		retry ->
+			ct:log("Connection reset before the TLS alert was received, retrying."),
+			do_tls13_post_handshake_alert_via_tunnel(ProxyType, OriginProtocol, Attempts - 1);
+		_ ->
+			ok
+	end.
 
 tls_handshake_error_gun_http2_init_retry_0(_) ->
 	doc("Ensure an early TLS connection close is propagated "

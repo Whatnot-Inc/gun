@@ -173,6 +173,8 @@ do_check_options([Opt={Name, _}|Opts]) ->
 		max_fragmented_header_block_size,
 		max_frame_size_received,
 		max_frame_size_sent,
+		max_header_list_size,
+		max_headers,
 		max_stream_window_size,
 		preface_timeout,
 		settings_timeout,
@@ -320,12 +322,12 @@ frame(State=#http2_state{http2_machine=HTTP2Machine0}, Frame, CookieStore, EvHan
 			EvHandlerState0
 	end,
 	case cow_http2_machine:frame(Frame, HTTP2Machine0) of
-		%% We only update the connection's window when receiving a lingering data frame.
-		{ok, HTTP2Machine} when element(1, Frame) =:= data ->
-			{update_window(State#http2_state{http2_machine=HTTP2Machine}),
-				CookieStore, EvHandlerState};
 		{ok, HTTP2Machine} ->
 			{maybe_ack_or_notify(State#http2_state{http2_machine=HTTP2Machine}, Frame),
+				CookieStore, EvHandlerState};
+		%% Non-empty DATA for a reset stream. The window was reduced.
+		{window_changed, _Increment, HTTP2Machine} ->
+			{update_window(State#http2_state{http2_machine=HTTP2Machine}),
 				CookieStore, EvHandlerState};
 		{ok, {data, StreamID, IsFin, Data}, HTTP2Machine} ->
 			data_frame(State#http2_state{http2_machine=HTTP2Machine},
@@ -501,7 +503,8 @@ tunnel_commands([{state, ProtoState}|Tail], Stream=#stream{tunnel=Tunnel},
 	tunnel_commands(Tail, Stream#stream{tunnel=Tunnel#tunnel{protocol_state=ProtoState}},
 		State, EvHandler, EvHandlerState);
 tunnel_commands([{error, Reason0}|_], #stream{id=StreamID, ref=StreamRef, reply_to=ReplyTo},
-		State, _EvHandler, EvHandlerState) ->
+		State0=#http2_state{socket=Socket, transport=Transport, http2_machine=HTTP2Machine0},
+		_EvHandler, EvHandlerState) ->
 	%% See gun:maybe_tls_alert for details.
 	Reason = case Reason0 of
 		closed ->
@@ -514,9 +517,24 @@ tunnel_commands([{error, Reason0}|_], #stream{id=StreamID, ref=StreamRef, reply_
 		_ ->
 			Reason0
 	end,
-	gun:reply(ReplyTo, {gun_error, self(), stream_ref(State, StreamRef),
-		{stream_error, Reason, 'Tunnel closed unexpectedly.'}}),
-	{{state, delete_stream(State, StreamID)}, EvHandlerState};
+	%% Drop the stream from the machine as well. DATA for this id is
+	%% then ignored. Do not RST a stream the machine no longer has.
+	case cow_http2_machine:reset_stream(StreamID, HTTP2Machine0) of
+		{ok, HTTP2Machine} ->
+			case Transport:send(Socket, cow_http2:rst_stream(StreamID, cancel)) of
+				ok ->
+					State = State0#http2_state{http2_machine=HTTP2Machine},
+					gun:reply(ReplyTo, {gun_error, self(), stream_ref(State, StreamRef),
+						{stream_error, Reason, 'Tunnel closed unexpectedly.'}}),
+					{{state, delete_stream(State, StreamID)}, EvHandlerState};
+				Error={error, _} ->
+					{Error, EvHandlerState}
+			end;
+		{error, _} ->
+			gun:reply(ReplyTo, {gun_error, self(), stream_ref(State0, StreamRef),
+				{stream_error, Reason, 'Tunnel closed unexpectedly.'}}),
+			{{state, delete_stream(State0, StreamID)}, EvHandlerState}
+	end;
 %% @todo Set a timeout for closing the Websocket stream.
 tunnel_commands([{closing, _}|Tail], Stream, State, EvHandler, EvHandlerState) ->
 	tunnel_commands(Tail, Stream, State, EvHandler, EvHandlerState);
@@ -1591,7 +1609,10 @@ ws_upgrade1(State=#http2_state{socket=Socket, transport=Transport,
 	{Headers2, GunExtensions} = case maps:get(compress, WsOpts, false) of
 		true ->
 			{[{<<"sec-websocket-extensions">>,
-				<<"permessage-deflate; client_max_window_bits; server_max_window_bits=15">>}
+				<<"permessage-deflate; client_max_window_bits">>}
+			|Headers1], [<<"permessage-deflate">>]};
+		compat ->
+			{[{<<"sec-websocket-extensions">>, <<"permessage-deflate">>}
 			|Headers1], [<<"permessage-deflate">>]};
 		false ->
 			{Headers1, []}

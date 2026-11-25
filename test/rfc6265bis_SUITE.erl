@@ -317,13 +317,14 @@ wpt_attributes_ctl_httponly(Config) ->
 		<<"testhttponly=t">>
 	} end, "/cookies/attributes", Config).
 
+%% None without Secure is not stored.
 wpt_attributes_ctl_samesite(Config) ->
 	doc("Test cookie attribute parsing with control characters: "
 		"in SameSite attribute value."),
 	do_wpt_ctl_test(fun(CTL) -> {
 		<<"testsamesite">>,
 		<<"testsamesite=t; SameSite=No", CTL, "ne; SameSite=None">>,
-		<<"testsamesite=t">>
+		<<>>
 	} end, "/cookies/attributes", Config).
 
 wpt_attributes_ctl_samesite2(Config) ->
@@ -332,7 +333,7 @@ wpt_attributes_ctl_samesite2(Config) ->
 	do_wpt_ctl_test(fun(CTL) -> {
 		<<"testsamesite2">>,
 		<<"testsamesite2=t; SameSite=None", CTL>>,
-		<<"testsamesite2=t">>
+		<<>>
 	} end, "/cookies/attributes", Config).
 
 %% @todo Redirect cookie test.
@@ -854,6 +855,31 @@ wpt_value_ctl(Config) ->
 		<<"test=value">>
 	} end, "/cookies/value", Config).
 
+malformed_path_set_cookie_header_no_crash(_) ->
+	doc("A request path that cannot be parsed as a URI must not crash "
+		"the caller when recording cookies from a response. (RFC6265bis 5.7)"),
+	Store0 = gun_cookies_list:init(),
+	Store0 = gun_cookies:set_cookie_header(<<"http">>, <<"example.com">>, <<"/a b">>,
+		200, [{<<"set-cookie">>, <<"a=b">>}], Store0, #{}).
+
+malformed_path_add_cookie_header_no_crash(_) ->
+	doc("A request path that cannot be parsed as a URI must not crash "
+		"the caller when building the Cookie header for a request. (RFC6265bis 5.8)"),
+	Store0 = gun_cookies_list:init(),
+	{[], Store0} = gun_cookies:add_cookie_header(<<"http">>,
+		<<"example.com">>, <<"/a b">>, [], Store0).
+
+malformed_percent_cookie_no_crash(_) ->
+	doc("A path whose percent-encoding is invalid must not crash "
+		"cookie handling. (RFC6265bis 5.7, 5.8)"),
+	Store0 = gun_cookies_list:init(),
+	Store1 = gun_cookies:set_cookie_header(<<"http">>, <<"example.com">>, <<"/">>,
+		200, [{<<"set-cookie">>, <<"a=b">>}], Store0, #{}),
+	{[], Store1} = gun_cookies:add_cookie_header(<<"http">>,
+		<<"example.com">>, <<"/%zz">>, [], Store1),
+	Store1 = gun_cookies:set_cookie_header(<<"http">>, <<"example.com">>, <<"/%zz">>,
+		200, [{<<"set-cookie">>, <<"c=d">>}], Store1, #{}).
+
 %% JSON files are created by taking the Javascript Object
 %% from the HTML files in the WPT suite, using the browser
 %% Developer console to convert into JSON:
@@ -867,7 +893,7 @@ wpt_value_ctl(Config) ->
 do_load_json(File0) ->
 	File = "../../test/wpt/cookies/" ++ File0 ++ ".json",
 	{ok, Bin} = file:read_file(File),
-	jsx:decode(Bin, [{return_maps, true}]).
+	json:decode(Bin).
 
 do_wpt_json_test(TestFile, TestPath, Config) ->
 	Tests = do_load_json(TestFile),
@@ -884,13 +910,10 @@ do_wpt_json_test(TestFile, TestPath, Config) ->
 
 do_wpt_ctl_test(Fun, TestPath, Config) ->
 	%% Control characters are defined by RFC5234 to be %x00-1F / %x7F.
-	%% We exclude \r for HTTP/1.1 because this causes errors
+	%% We exclude NUL, CR and LF bytes because this causes errors
 	%% at the header parsing level.
-	CTLs0 = lists:seq(0, 16#1F) ++ [16#7F],
-	CTLs = case config(protocol, Config) of
-		http -> CTLs0 -- "\r";
-		http2 -> CTLs0
-	end,
+	CTLs0 = lists:seq(16#01, 16#1F) ++ [16#7F],
+	CTLs = CTLs0 -- "\r\n",
 	%% All CTLs except \t should cause the cookie to be rejected.
 	_ = [begin
 		{Name, Cookie, Expected} = Fun(CTL),

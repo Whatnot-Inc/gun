@@ -14,7 +14,7 @@ protocols is required in order to read this guide.
 
 Gun is tested and supported on Linux, FreeBSD, Windows and OSX.
 
-Gun is developed for Erlang/OTP 22.0 and newer.
+Gun is developed for Erlang/OTP 27.0 and newer.
 
 === License
 
@@ -38,7 +38,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 === Versioning
 
-Gun uses http://semver.org/[Semantic Versioning 2.0.0].
+Gun uses https://semver.org/[Semantic Versioning 2.0.0].
 
 === Conventions
 
