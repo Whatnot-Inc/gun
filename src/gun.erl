@@ -15,10 +15,6 @@
 -module(gun).
 -behavior(gen_statem).
 
--ifdef(OTP_RELEASE).
--compile({nowarn_deprecated_function, [{erlang, get_stacktrace, 0}]}).
--endif.
-
 %% Connection.
 -export([open/2]).
 -export([open/3]).
@@ -223,6 +219,7 @@
 	cookie_ignore_informational => boolean(),
 	flow => pos_integer(),
 	keepalive => timeout(),
+	max_headers => non_neg_integer(),
 	max_header_block_size => non_neg_integer(),
 	max_trailer_block_size => non_neg_integer(),
 	transform_header_name => fun((binary()) -> binary()),
@@ -256,6 +253,7 @@
 	max_fragmented_header_block_size => 16384..16#7fffffff,
 	max_frame_size_received => 16384..16777215,
 	max_frame_size_sent => 16384..16777215 | infinity,
+	max_headers => non_neg_integer(),
 	max_stream_window_size => 0..16#7fffffff,
 	preface_timeout => timeout(),
 	settings_timeout => timeout(),
@@ -290,11 +288,12 @@
 
 -type ws_opts() :: #{
 	closing_timeout => timeout(),
-	compress => boolean(),
+	compress => boolean() | compat,
 	default_protocol => module(),
 	flow => pos_integer(),
 	invalid_request_headers => raise | ignore,
 	keepalive => timeout(),
+	max_frame_size => pos_integer() | infinity,
 	protocols => [{binary(), module()}],
 	reply_to => pid(),
 	silence_pings => boolean(),
@@ -688,6 +687,7 @@ headers(ServerPid, Method, Path, Headers) ->
 -spec headers(pid(), iodata(), iodata(), req_headers(), req_opts()) -> stream_ref().
 headers(ServerPid, Method, Path, Headers0, ReqOpts) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_request_line(Method, Path, ReqOpts),
 	maybe_invalid_request_headers(Headers, ReqOpts),
 	Tunnel = get_tunnel(ReqOpts),
 	StreamRef = make_stream_ref(Tunnel),
@@ -704,6 +704,7 @@ request(ServerPid, Method, Path, Headers, Body) ->
 -spec request(pid(), iodata(), iodata(), req_headers(), iodata(), req_opts()) -> stream_ref().
 request(ServerPid, Method, Path, Headers, Body, ReqOpts) ->
 	NormHeaders = normalize_headers(Headers),
+	maybe_invalid_request_line(Method, Path, ReqOpts),
 	maybe_invalid_request_headers(NormHeaders, ReqOpts),
 	Tunnel = get_tunnel(ReqOpts),
 	StreamRef = make_stream_ref(Tunnel),
@@ -734,26 +735,50 @@ normalize_headers([{Name, Value}|Tail]) when is_atom(Name) ->
 normalize_headers(Headers) when is_map(Headers) ->
 	normalize_headers(maps:to_list(Headers)).
 
-maybe_invalid_request_headers(Headers, ReqOpts) ->
+maybe_invalid_request_line(Method, Path, ReqOpts) ->
 	case maps:get(invalid_request_headers, ReqOpts, raise) of
 		raise ->
-			case maybe_invalid_request_headers(Headers) of
-				ok ->
-					ok;
-				{error, Name} ->
-					error({invalid_request_header, Name,
-						"An invalid request header was detected."})
-			end;
+			validate_request_line(method, Method),
+			validate_request_line(path, Path);
 		ignore ->
 			ok
 	end.
 
-maybe_invalid_request_headers([{Name, Value}|Tail]) ->
-	case binary:match(iolist_to_binary(Value), [<<$\r>>, <<$\n>>]) of
-		nomatch -> maybe_invalid_request_headers(Tail);
-		_ -> {error, Name}
+validate_request_line(Type, Value) ->
+	case is_valid_request(Value) of
+		true -> ok;
+		false -> error({invalid_request_line, Type,
+			"An invalid request line was detected."})
+	end.
+
+is_valid_request(Value) ->
+	nomatch =:= binary:match(iolist_to_binary(Value), [<<$\r>>, <<$\n>>, <<0>>]).
+
+maybe_invalid_request_headers(Headers, ReqOpts) ->
+	case maps:get(invalid_request_headers, ReqOpts, raise) of
+		raise ->
+			validate_request_headers(Headers);
+		ignore ->
+			ok
+	end.
+
+validate_request_headers([{Name, Value}|Tail]) ->
+	case is_valid_request(Name) andalso is_valid_request(Value) of
+		true -> validate_request_headers(Tail);
+		false -> error({invalid_request_header, Name,
+			"An invalid request header was detected."})
 	end;
-maybe_invalid_request_headers([]) ->
+validate_request_headers([]) ->
+	ok.
+
+maybe_invalid_connect_destination(#{host := Host}, ReqOpts) when not is_tuple(Host) ->
+	case maps:get(invalid_request_headers, ReqOpts, raise) of
+		raise ->
+			validate_request_line(host, Host);
+		ignore ->
+			ok
+	end;
+maybe_invalid_connect_destination(_, _) ->
 	ok.
 
 %% Streaming data.
@@ -794,6 +819,7 @@ connect(ServerPid, Destination, Headers) ->
 -spec connect(pid(), connect_destination(), req_headers(), req_opts()) -> stream_ref().
 connect(ServerPid, Destination, Headers0, ReqOpts) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_connect_destination(Destination, ReqOpts),
 	maybe_invalid_request_headers(Headers, ReqOpts),
 	Tunnel = get_tunnel(ReqOpts),
 	StreamRef = make_stream_ref(Tunnel),
@@ -1021,6 +1047,7 @@ ws_upgrade(ServerPid, Path) ->
 -spec ws_upgrade(pid(), iodata(), req_headers()) -> stream_ref().
 ws_upgrade(ServerPid, Path, Headers0) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_request_line(<<"GET">>, Path, #{invalid_request_headers => raise}),
 	maybe_invalid_request_headers(Headers, #{invalid_request_headers => raise}),
 	StreamRef = make_ref(),
 	gen_statem:cast(ServerPid, {ws_upgrade, self(), StreamRef, Path, Headers}),
@@ -1029,6 +1056,7 @@ ws_upgrade(ServerPid, Path, Headers0) ->
 -spec ws_upgrade(pid(), iodata(), req_headers(), ws_opts()) -> stream_ref().
 ws_upgrade(ServerPid, Path, Headers0, WsOpts0) ->
 	Headers = normalize_headers(Headers0),
+	maybe_invalid_request_line(<<"GET">>, Path, WsOpts0),
 	maybe_invalid_request_headers(Headers, WsOpts0),
 	Tunnel = get_tunnel(WsOpts0),
 	WsOpts = maps:without([invalid_request_headers, tunnel], WsOpts0),
@@ -1050,6 +1078,7 @@ start_link(Owner, Host, Port, Opts) ->
 	gen_statem:start_link(?MODULE, {Owner, Host, Port, Opts}, []).
 
 init({Owner, Host, Port, Opts}) ->
+	proc_lib:set_label({?MODULE, Host, Port}),
 	Retry = maps:get(retry, Opts, 5),
 	OriginTransport = maps:get(transport, Opts, default_transport(Port)),
 	%% When Unix Domain Sockets are used we set
@@ -1242,23 +1271,12 @@ initial_tls_handshake(_, {retries, Retries, Socket}, State0=#state{opts=Opts, or
 
 ensure_tls_opts(Protocols0, TransOpts0, OriginHost) ->
 	%% CA certificates.
-	TransOpts1 = case lists:keymember(cacerts, 1, TransOpts0) of
+	TransOpts1 = case lists:keymember(cacerts, 1, TransOpts0)
+			orelse lists:keymember(cacertfile, 1, TransOpts0) of
 		true ->
 			TransOpts0;
 		false ->
-			case lists:keymember(cacertfile, 1, TransOpts0) of
-				true ->
-					TransOpts0;
-				false ->
-					%% This function was added in OTP-25. We use it  when it is
-					%% available and keep the previous behavior when it isn't.
-					case erlang:function_exported(public_key, cacerts_get, 0) of
-						true ->
-							[{cacerts, public_key:cacerts_get()}|TransOpts0];
-						false ->
-							TransOpts0
-					end
-			end
+			[{cacerts, public_key:cacerts_get()}|TransOpts0]
 	end,
 	%% Wildcard certificate matching.
 	TransOpts2 = case lists:keymember(customize_hostname_check, 1, TransOpts1) of
@@ -1845,7 +1863,7 @@ handle_common({call, From}, _, _, _) ->
 handle_common(cast, _, StateName, _) when StateName =/= connected ->
 	{keep_state_and_data, postpone};
 handle_common(Type, Event, StateName, StateData) ->
-	error_logger:error_msg("Unexpected event in state ~p of type ~p:~n~w~n~p~n",
+	logger:error("Unexpected event in state ~p of type ~p:~n~w~n~p~n",
 		[StateName, Type, Event, StateData]),
 	keep_state_and_data.
 

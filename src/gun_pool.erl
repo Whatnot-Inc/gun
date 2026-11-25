@@ -570,6 +570,7 @@ start_link(Host, Port, Opts) ->
 	gen_statem:start_link(?MODULE, {Host, Port, Opts}, []).
 
 init({Host, Port, Opts}) ->
+	proc_lib:set_label({?MODULE, Host, Port}),
 	process_flag(trap_exit, true),
 	PoolKey = gun_pools_key(Host, Port, Opts),
 	true = ets:insert_new(gun_pools, {PoolKey, self()}),

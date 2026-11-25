@@ -110,6 +110,8 @@ do_check_options([{keepalive, infinity}|Opts]) ->
 	do_check_options(Opts);
 do_check_options([{keepalive, K}|Opts]) when is_integer(K), K > 0 ->
 	do_check_options(Opts);
+do_check_options([{max_headers, M}|Opts]) when is_integer(M), M > 0 ->
+	do_check_options(Opts);
 do_check_options([{max_header_block_size, M}|Opts]) when is_integer(M), M > 0 ->
 	do_check_options(Opts);
 do_check_options([{max_trailer_block_size, M}|Opts]) when is_integer(M), M > 0 ->
@@ -156,22 +158,24 @@ handle(Data, State=#http_state{opts=Opts, in=head, buffer=Buffer,
 		_ ->
 			EvHandlerState0
 	end,
-	Data2 = << Buffer/binary, Data/binary >>,
-	case binary:match(Data2, <<"\r\n\r\n">>) of
+	case match_header_section_end(Data, Buffer) of
+		match ->
+			handle_head(<<Buffer/binary, Data/binary>>,
+				State#http_state{buffer= <<>>},
+				CookieStore, EvHandler, EvHandlerState);
 		nomatch ->
 			MaxSize = maps:get(max_header_block_size, Opts, 100000),
-			case byte_size(Data2) > MaxSize of
+			case byte_size(Buffer) + byte_size(Data) > MaxSize of
 				true ->
 					Reason = {connection_error, limit_reached,
 						"The response header block is too large."},
 					gun:reply(ReplyTo, {gun_error, self(), Reason}),
 					{{error, Reason}, CookieStore, EvHandlerState};
 				false ->
-					{{state, State#http_state{buffer=Data2}}, CookieStore, EvHandlerState}
-			end;
-		{_, _} ->
-			handle_head(Data2, State#http_state{buffer= <<>>},
-				CookieStore, EvHandler, EvHandlerState)
+					{{state, State#http_state{
+						buffer= <<Buffer/binary, Data/binary>>}},
+						CookieStore, EvHandlerState}
+			end
 	end;
 %% Everything sent to the socket until it closes is part of the response body.
 handle(Data, State=#http_state{in=body_close}, CookieStore, _, EvHandlerState) ->
@@ -215,7 +219,7 @@ handle(Data, State=#http_state{in=body_chunked, in_state=InState, buffer=Buffer,
 					handle(Rest, State1#http_state{buffer = <<>>, in=body_trailer},
 						CookieStore, EvHandler, EvHandlerState);
 				{no_trailers, keepalive} ->
-					handle(Rest, end_stream(State1#http_state{buffer= <<>>}),
+					end_keepalive_stream(Rest, State1#http_state{buffer= <<>>},
 						CookieStore, EvHandler, EvHandlerState);
 				{no_trailers, close} ->
 					{[{state, end_stream(State1)}, close], CookieStore, EvHandlerState}
@@ -239,7 +243,7 @@ handle(Data, State=#http_state{in=body_chunked, in_state=InState, buffer=Buffer,
 					handle(Rest, State1#http_state{buffer = <<>>, in=body_trailer},
 						CookieStore, EvHandler, EvHandlerState);
 				{no_trailers, keepalive} ->
-					handle(Rest, end_stream(State1#http_state{buffer= <<>>}),
+					end_keepalive_stream(Rest, State1#http_state{buffer= <<>>},
 						CookieStore, EvHandler, EvHandlerState);
 				{no_trailers, close} ->
 					{[{state, end_stream(State1)}, close], CookieStore, EvHandlerState}
@@ -249,21 +253,9 @@ handle(Data, State=#http_state{opts=Opts, in=body_trailer,
 		buffer=Buffer, connection=Conn,
 		streams=[#stream{ref=StreamRef, reply_to=ReplyTo}|_]},
 		CookieStore, EvHandler, EvHandlerState0) ->
-	Data2 = << Buffer/binary, Data/binary >>,
-	case binary:match(Data2, <<"\r\n\r\n">>) of
-		nomatch ->
-			MaxSize = maps:get(max_trailer_block_size, Opts, 10000),
-			case byte_size(Data2) > MaxSize of
-				true ->
-					Reason = {connection_error, limit_reached,
-						"The response trailer block is too large."},
-					gun:reply(ReplyTo, {gun_error, self(), Reason}),
-					{{error, Reason}, CookieStore, EvHandlerState0};
-				false ->
-					{{state, State#http_state{buffer=Data2}}, CookieStore, EvHandlerState0}
-			end;
-		{_, _} ->
-			{Trailers, Rest} = cow_http:parse_headers(Data2),
+	case match_header_section_end(Data, Buffer) of
+		match ->
+			{Trailers, Rest} = cow_http:parse_headers(<<Buffer/binary, Data/binary>>),
 			%% @todo We probably want to pass this to gun_content_handler?
 			RealStreamRef = stream_ref(State, StreamRef),
 			gun:reply(ReplyTo, {gun_trailers, self(), RealStreamRef, Trailers}),
@@ -275,10 +267,23 @@ handle(Data, State=#http_state{opts=Opts, in=body_trailer,
 			EvHandlerState = EvHandler:response_end(ResponseEvent, EvHandlerState1),
 			case Conn of
 				keepalive ->
-					handle(Rest, end_stream(State#http_state{buffer= <<>>}),
+					end_keepalive_stream(Rest, State#http_state{buffer= <<>>},
 						CookieStore, EvHandler, EvHandlerState);
 				close ->
 					{[{state, end_stream(State)}, close], CookieStore, EvHandlerState}
+			end;
+		nomatch ->
+			MaxSize = maps:get(max_trailer_block_size, Opts, 10000),
+			case byte_size(Buffer) + byte_size(Data) > MaxSize of
+				true ->
+					Reason = {connection_error, limit_reached,
+						"The response trailer block is too large."},
+					gun:reply(ReplyTo, {gun_error, self(), Reason}),
+					{{error, Reason}, CookieStore, EvHandlerState0};
+				false ->
+					{{state, State#http_state{
+						buffer= <<Buffer/binary, Data/binary>>}},
+						CookieStore, EvHandlerState0}
 			end
 	end;
 %% We know the length of the rest of the body.
@@ -301,7 +306,7 @@ handle(Data, State=#http_state{in={body, Length}, connection=Conn,
 			}, EvHandlerState0),
 			case Conn of
 				keepalive ->
-					{[{state, end_stream(State1)}, {active, true}], CookieStore, EvHandlerState};
+					end_keepalive_stream(<<>>, State1, CookieStore, EvHandler, EvHandlerState);
 				close ->
 					{[{state, end_stream(State1)}, close], CookieStore, EvHandlerState}
 			end;
@@ -315,25 +320,50 @@ handle(Data, State=#http_state{in={body, Length}, connection=Conn,
 				reply_to => ReplyTo
 			}, EvHandlerState0),
 			case Conn of
-				keepalive -> handle(Rest, end_stream(State1), CookieStore, EvHandler, EvHandlerState);
+				keepalive ->
+					end_keepalive_stream(Rest, State1, CookieStore, EvHandler, EvHandlerState);
 				close -> {[{state, end_stream(State1)}, close], CookieStore, EvHandlerState}
 			end
 	end.
 
+match_header_section_end(<<"\n\r\n",_/bits>>, Buffer)
+		when binary_part(Buffer, byte_size(Buffer) - 1, 1) =:= <<"\r">> ->
+	match;
+match_header_section_end(<<"\r\n",_/bits>>, Buffer)
+		when binary_part(Buffer, byte_size(Buffer) - 2, 2) =:= <<"\r\n">> ->
+	match;
+match_header_section_end(<<"\n",_/bits>>, Buffer)
+		when binary_part(Buffer, byte_size(Buffer) - 3, 3) =:= <<"\r\n\r">> ->
+	match;
+match_header_section_end(Data, _) ->
+	case binary:match(Data, <<"\r\n\r\n">>) of
+		{_, _} -> match;
+		nomatch -> nomatch
+	end.
+
 handle_head(Data, State=#http_state{opts=Opts,
-		streams=[#stream{ref=StreamRef, authority=Authority, path=Path}|_]},
+		streams=[#stream{ref=StreamRef, reply_to=ReplyTo, authority=Authority, path=Path}|_]},
 		CookieStore0, EvHandler, EvHandlerState) ->
 	{Version, Status, _, Rest0} = cow_http:parse_status_line(Data),
 	{Headers, Rest} = cow_http:parse_headers(Rest0),
-	CookieStore = gun_cookies:set_cookie_header(scheme(State),
-		Authority, Path, Status, Headers, CookieStore0, Opts),
-	case StreamRef of
-		{connect, _, _} when Status >= 200, Status < 300 ->
-			handle_connect(Rest, State, CookieStore, EvHandler, EvHandlerState, Status, Headers);
-		_ when Status >= 100, Status =< 199 ->
-			handle_inform(Rest, State, CookieStore, EvHandler, EvHandlerState, Version, Status, Headers);
-		_ ->
-			handle_response(Rest, State, CookieStore, EvHandler, EvHandlerState, Version, Status, Headers)
+	MaxHeaders = maps:get(max_headers, Opts, 100),
+	case length(Headers) > MaxHeaders of
+		true ->
+			Reason = {connection_error, limit_reached,
+				"The number of headers is larger than configuration allows. (RFC9110 5.4)"},
+			gun:reply(ReplyTo, {gun_error, self(), Reason}),
+			{{error, Reason}, CookieStore0, EvHandlerState};
+		false ->
+			CookieStore = gun_cookies:set_cookie_header(scheme(State),
+				Authority, Path, Status, Headers, CookieStore0, Opts),
+			case StreamRef of
+				{connect, _, _} when Status >= 200, Status < 300 ->
+					handle_connect(Rest, State, CookieStore, EvHandler, EvHandlerState, Status, Headers);
+				_ when Status >= 100, Status =< 199 ->
+					handle_inform(Rest, State, CookieStore, EvHandler, EvHandlerState, Version, Status, Headers);
+				_ ->
+					handle_response(Rest, State, CookieStore, EvHandler, EvHandlerState, Version, Status, Headers)
+			end
 	end.
 
 %% We handle HTTP/1.0 responses to CONNECT requests the same as HTTP/1.1.
@@ -484,9 +514,9 @@ handle_response(Rest, State=#http_state{version=ClientVersion, opts=Opts, connec
 		IsFin =:= fin, Conn2 =:= close ->
 			{close, CookieStore, EvHandlerState3};
 		IsFin =:= fin ->
-			handle(Rest, end_stream(State#http_state{in=In,
+			end_keepalive_stream(Rest, State#http_state{in=In,
 				in_state={0, 0}, connection=Conn2,
-				streams=[Stream#stream{handler_state=Handlers}|Tail]}),
+				streams=[Stream#stream{handler_state=Handlers}|Tail]},
 				CookieStore, EvHandler, EvHandlerState3);
 		Conn2 =:= close ->
 			close_streams(State, Tail, closing),
@@ -507,6 +537,20 @@ handle_response(Rest, State=#http_state{version=ClientVersion, opts=Opts, connec
 				in_state={0, 0}, connection=Conn2,
 				streams=[Stream#stream{handler_state=Handlers}|Tail]},
 				CookieStore, EvHandler, EvHandlerState3)
+	end.
+
+%% End a keepalive stream and reactivate the socket. Flow belongs to the
+%% stream that just ended, so nothing else will re-enable reading. When
+%% Rest is empty we know handle/5 would only return {state, ...}; when it
+%% is not, commands from parsing the next response may override active.
+end_keepalive_stream(<<>>, State, CookieStore, _, EvHandlerState) ->
+	{[{state, end_stream(State)}, {active, true}], CookieStore, EvHandlerState};
+end_keepalive_stream(Rest, State, CookieStore, EvHandler, EvHandlerState) ->
+	case handle(Rest, end_stream(State), CookieStore, EvHandler, EvHandlerState) of
+		{Commands, CookieStore1, EvHandlerState1} when is_list(Commands) ->
+			{[{active, true}|Commands], CookieStore1, EvHandlerState1};
+		{Command, CookieStore1, EvHandlerState1} ->
+			{[{active, true}, Command], CookieStore1, EvHandlerState1}
 	end.
 
 %% The state must be first in order to retrieve it when the stream ended.
@@ -1030,11 +1074,15 @@ ws_upgrade(State=#http_state{version='HTTP/1.0'},
 ws_upgrade(State=#http_state{out=head}, StreamRef, ReplyTo,
 		Host, Port, Path, Headers0, WsOpts, CookieStore0, EvHandler, EvHandlerState0) ->
 	{Headers1, GunExtensions} = case maps:get(compress, WsOpts, false) of
-		true -> {[{<<"sec-websocket-extensions">>,
-				<<"permessage-deflate; client_max_window_bits; server_max_window_bits=15">>}
-			|Headers0],
-			[<<"permessage-deflate">>]};
-		false -> {Headers0, []}
+		true ->
+			{[{<<"sec-websocket-extensions">>,
+				<<"permessage-deflate; client_max_window_bits">>}
+			|Headers0], [<<"permessage-deflate">>]};
+		compat ->
+			{[{<<"sec-websocket-extensions">>, <<"permessage-deflate">>}
+			|Headers0], [<<"permessage-deflate">>]};
+		false ->
+			{Headers0, []}
 	end,
 	Headers2 = case maps:get(protocols, WsOpts, []) of
 		[] -> Headers1;

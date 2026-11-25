@@ -2,7 +2,7 @@
 
 PROJECT = whatnot_gun
 PROJECT_DESCRIPTION = HTTP/1.1, HTTP/2 and Websocket client for Erlang/OTP.
-PROJECT_VERSION = 2.4.7
+PROJECT_VERSION = 2.6.0
 
 # The OTP application is renamed to whatnot_gun for the Whatnot fork, but the
 # modules, application callback, and supervisor keep their upstream `gun_*`
@@ -23,7 +23,7 @@ CT_OPTS += -ct_hooks gun_ct_hook [] # -boot start_sasl
 LOCAL_DEPS = public_key ssl
 
 DEPS = cowlib
-dep_cowlib = git https://github.com/ninenines/cowlib 2.17.0
+dep_cowlib = git https://github.com/ninenines/cowlib 2.20.0
 
 ifeq ($(GUN_QUICER),1)
 DEPS += quicer
@@ -32,34 +32,33 @@ endif
 
 DOC_DEPS = asciideck
 
-TEST_DEPS = $(if $(CI_ERLANG_MK),ci.erlang.mk) ct_helper cowboy ranch jsx
+TEST_DEPS = $(if $(CI_ERLANG_MK),ci.erlang.mk) ct_helper cowboy ranch
 dep_ct_helper = git https://github.com/ninenines/ct_helper.git master
 dep_cowboy_commit = 2.9.0
 dep_ranch_commit = 2.0.0
-dep_jsx = git https://github.com/talentdeficit/jsx v3.1.0
 
 # CI configuration.
 
 dep_ci.erlang.mk = git https://github.com/ninenines/ci.erlang.mk master
 DEP_EARLY_PLUGINS = ci.erlang.mk
 
-AUTO_CI_OTP ?= OTP-LATEST-24+
-AUTO_CI_WINDOWS ?= OTP-LATEST-24+
+AUTO_CI_OTP ?= OTP-LATEST-27+
+AUTO_CI_WINDOWS ?= OTP-LATEST-27+
 
 # Hex configuration.
 define HEX_TARBALL_EXTRA_METADATA
 #{
 	licenses => [<<"ISC">>],
 	links => #{
-		<<"Function reference">> => <<"https://ninenines.eu/docs/en/gun/2.4/manual/">>,
-		<<"User guide">> => <<"https://ninenines.eu/docs/en/gun/2.4/guide/">>,
+		<<"Function reference">> => <<"https://ninenines.eu/docs/en/gun/2.6/manual/">>,
+		<<"User guide">> => <<"https://ninenines.eu/docs/en/gun/2.6/guide/">>,
 		<<"GitHub">> => <<"https://github.com/ninenines/gun">>,
 		<<"Sponsor">> => <<"https://github.com/sponsors/essen">>
 	}
 }
 endef
 
-hex_req_cowlib = >= 2.15.0 and < 3.0.0
+hex_req_cowlib = >= 2.19.0 and < 3.0.0
 
 # Standard targets.
 
