@@ -154,6 +154,7 @@ http_opts() :: #{
     cookie_ignore_informational => boolean(),
     flow                        => pos_integer(),
     keepalive                   => timeout(),
+    max_headers                 => non_neg_integer(),
     max_header_block_size       => non_neg_integer(),
     max_trailer_block_size      => non_neg_integer(),
     transform_header_name       => fun((binary()) -> binary()),
@@ -191,6 +192,14 @@ empty line when the connection is idle. Gun only makes a best
 effort here as servers usually have configurable limits to drop
 idle connections. Disabled by default due to potential
 incompatibilities.
+
+max_headers (100)::
+
+Maximum number of headers allowed per response. Note that
+this is checked only after the full header block was
+received. When the number of headers exceeds this limit
+Gun closes the connection with a `limit_reached`
+connection error.
 
 max_header_block_size (100000)::
 
@@ -245,6 +254,7 @@ http2_opts() :: #{
     max_fragmented_header_block_size => 16384..16#7fffffff,
     max_frame_size_received        => 16384..16777215,
     max_frame_size_sent            => 16384..16777215 | infinity,
+    max_headers                    => non_neg_integer(),
     max_stream_window_size         => 0..16#7fffffff,
     preface_timeout                => timeout(),
     settings_timeout               => timeout(),
@@ -573,11 +583,12 @@ detail.
 ----
 ws_opts() :: #{
     closing_timeout  => timeout(),
-    compress         => boolean(),
+    compress         => boolean() | compat,
     default_protocol => module(),
     flow             => pos_integer(),
     invalid_request_headers => raise | ignore,
     keepalive        => timeout(),
+    max_frame_size   => pos_integer() | infinity,
     protocols        => [{binary(), module()}],
     silence_pings    => boolean(),
     user_opts        => any()
@@ -599,6 +610,10 @@ compress (false)::
 Whether to enable permessage-deflate compression. This does
 not guarantee that compression will be used as it is the
 server that ultimately decides. Defaults to false.
++
+The value `compat` will enable compression without sending
+any parameter. It should help connecting to servers that
+reject parameters that Gun sends by default.
 
 default_protocol (gun_ws_h)::
 
@@ -621,6 +636,13 @@ own risk.
 keepalive (infinity)::
 
 Time between pings in milliseconds.
+
+max_frame_size (1000000)::
+
+Maximum size in bytes of an incoming Websocket message,
+including across fragments and after decompression.
+Gun closes the connection when this limit is exceeded.
+The value `infinity` disables the limit.
 
 protocols ([])::
 
@@ -645,6 +667,9 @@ By default no user option is defined.
 
 == Changelog
 
+* *2.6*: The `max_headers` HTTP/1.1 option was added.
+* *2.5*: The `max_headers` HTTP/2 option was added.
+* *2.5*: Websocket `compress` option value `compat` was added.
 * *2.4*: The `max_header_block_size` and `max_trailer_block_size`
          HTTP/1.1 options were added.
 * *2.4*: The `invalid_request_headers` request option was added

@@ -260,6 +260,131 @@ invalid_request_headers_raise_ws_upgrade(_) ->
 	end,
 	gun:close(Pid).
 
+invalid_request_headers_raise_name(_) ->
+	doc("Ensure a request header with a CRLF in its name raises an "
+		"exception, the same way a CRLF in its value already does."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/", [{<<"x-test\r\nInjected">>, <<"value">>}]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, _, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_ignore(_) ->
+	doc("Ensure an invalid request path is sent when allowed by configuration."),
+	{ok, ListenSocket} = gen_tcp:listen(0, [binary, {active, false}]),
+	{ok, {_, Port}} = inet:sockname(ListenSocket),
+	{ok, Pid} = gun:open("localhost", Port, #{protocols => [http]}),
+	{ok, ClientSocket} = gen_tcp:accept(ListenSocket, 5000),
+	{ok, http} = gun:await_up(Pid),
+	_ = gun:get(Pid, "/x\r\nX-Injected: 1", [], #{
+		invalid_request_headers => ignore
+	}),
+	{ok, Data} = gen_tcp:recv(ClientSocket, 0, 5000),
+	true = binary:match(Data, <<"X-Injected: 1">>) =/= nomatch,
+	gun:close(Pid).
+
+invalid_request_line_raise_path(_) ->
+	doc("Ensure an invalid request path raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/search?q=x\r\nX-Injected: 1", []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, path, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_method(_) ->
+	doc("Ensure an invalid request method raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:request(Pid, <<"GET\r\nX-Injected: 1">>, "/", [], <<>>),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, method, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_ws_upgrade(_) ->
+	doc("Ensure an invalid Websocket upgrade path raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:ws_upgrade(Pid, "/ws\r\nX-Injected: 1", []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, path, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_connect(_) ->
+	doc("Ensure an invalid CONNECT destination host raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:connect(Pid, #{host => "localhost\r\nX-Injected: 1", port => 1234}, []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, host, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_headers_raise_nul_value(_) ->
+	doc("Ensure a NUL byte in a request header value raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/", [{<<"x-test">>, <<"bad", 0, "value">>}]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, _, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_headers_raise_nul_name(_) ->
+	doc("Ensure a NUL byte in a request header name raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, "/", [{<<"x-test", 0, "Injected">>, <<"value">>}]),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_header, _, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_path_nul(_) ->
+	doc("Ensure a NUL byte in the request path raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:get(Pid, <<"/search", 0, "q=1">>, []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, path, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_method_nul(_) ->
+	doc("Ensure a NUL byte in the request method raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:request(Pid, <<"GET", 0>>, "/", [], <<>>),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, method, _} -> ok
+	end,
+	gun:close(Pid).
+
+invalid_request_line_raise_connect_nul(_) ->
+	doc("Ensure a NUL byte in the CONNECT destination host raises an exception."),
+	{ok, Pid} = gun:open("localhost", 12345, #{protocols => [http]}),
+	try
+		gun:connect(Pid, #{host => <<"localhost", 0>>, port => 1234}, []),
+		ct:fail("expected exception")
+	catch
+		error:{invalid_request_line, host, _} -> ok
+	end,
+	gun:close(Pid).
+
 keepalive_infinity(_) ->
 	doc("Ensure infinity for keepalive is accepted by all protocols."),
 	{ok, ConnPid} = gun:open("localhost", 12345, #{
@@ -785,11 +910,9 @@ supervise_false(_) ->
 	ok.
 
 tls13_post_handshake_alert_http1(_) ->
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_http1();
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -841,11 +964,9 @@ do_tls13_post_handshake_alert_http1() ->
 	gun:close(ConnPid).
 
 tls13_post_handshake_alert_http2(_) ->
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_http2();
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -898,11 +1019,9 @@ tls13_post_handshake_alert_http1_via_http(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/1.1 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(http, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -911,11 +1030,9 @@ tls13_post_handshake_alert_http2_via_http(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/1.1 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(http, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -924,11 +1041,9 @@ tls13_post_handshake_alert_http1_via_https(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/1.1 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(https, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -937,11 +1052,9 @@ tls13_post_handshake_alert_http2_via_https(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/1.1 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(https, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -950,11 +1063,9 @@ tls13_post_handshake_alert_http1_via_h2c(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/2 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2c, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -963,11 +1074,9 @@ tls13_post_handshake_alert_http2_via_h2c(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/2 clear-text tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2c, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -976,11 +1085,9 @@ tls13_post_handshake_alert_http1_via_h2(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/1.1 server "
 		"over an HTTP/2 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2, http);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
@@ -989,11 +1096,9 @@ tls13_post_handshake_alert_http2_via_h2(_) ->
 	doc("Ensure that a TLS 1.3 post-handshake alert is properly "
 		"propagated when connecting to an HTTP/2 server "
 		"over an HTTP/2 TLS tunnel in mTLS scenarios."),
-	case {os:type(), erlang:function_exported(lists, enumerate, 3)} of
-		{{unix, linux}, true} ->
+	case os:type() of
+		{unix, linux} ->
 			do_tls13_post_handshake_alert_via_tunnel(h2, http2);
-		{{unix, linux}, false} ->
-			{skip, "Handling of TLS 1.3 alerts was improved in an OTP-26 patch release."};
 		_ ->
 			{skip, "This test is only enabled on Linux to avoid intermittent failures."}
 	end.
